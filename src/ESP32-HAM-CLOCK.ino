@@ -123,15 +123,15 @@ int backlightPercent = TFT_BACKLIGHT;
 #define TOUCH_CS 33
 #endif
 #ifndef TOUCH_IRQ
-#define TOUCH_IRQ 36 // dla zewnętrznego TFT ILI9341 użyć 35
-//#define TOUCH_IRQ 35 // dla zewnętrznego TFT ILI9341
+//#define TOUCH_IRQ 36 // domyślnie 36 a dla zewnętrznego TFT ILI9341 użyć 35
+#define TOUCH_IRQ 35 // dla zewnętrznego TFT ILI9341
 #endif
 #ifndef TOUCH_MOSI
 #define TOUCH_MOSI 32
 #endif
 #ifndef TOUCH_MISO
-#define TOUCH_MISO 39 // dla zewnętrznego TFT ILI9341 użyć 27
-//#define TOUCH_MISO 27 // dla zewnętrznego TFT ILI9341
+//#define TOUCH_MISO 39 // domyślnie 39 a dla zewnętrznego TFT ILI9341 użyć 27
+#define TOUCH_MISO 27 // dla zewnętrznego TFT ILI9341
 #endif
 #ifndef TOUCH_CLK
 #define TOUCH_CLK 25
@@ -207,6 +207,7 @@ bool tftAutoSwitchEnabled = false;
 int tftAutoSwitchTimeSec = DEFAULT_TFT_SWITCH_TIME_SEC;
 unsigned long tftAutoSwitchLastMs = 0;
 ScreenType tftAutoSwitchLastScreen = SCREEN_OFF;
+unsigned long autoswitchPausedUntilMs = 0; // pauza autoswitch po dotknięciu środka ekranu
 unsigned long lastScreenUpdate = 0;
 const unsigned long SCREEN_UPDATE_INTERVAL = 100; // Aktualizuj ekran co 100ms
 const unsigned long DX_SCREEN_MIN_REDRAW_MS = 5000; // Ogranicz zapis tabeli DX do max 1 raz/5s
@@ -328,14 +329,13 @@ enum DxTableSizeMode : uint8_t {
 uint8_t dxTableSizeMode = DX_TABLE_SIZE_NORMAL;
 
 // Font z polskimi znakami dla daty/dnia tygodnia
-#define ROBOTO_FONT10_NAME "/fonts/Inter-Regular10"
-#define ROBOTO_FONT10_FILE "/fonts/Inter-Regular10.vlw"
-#define ROBOTO_FONT12_NAME "/fonts/Inter-Regular12"
-#define ROBOTO_FONT12_FILE "/fonts/Inter-Regular12.vlw"
-#define ROBOTO_FONT20_NAME "/fonts/Inter-Regular20"
-#define ROBOTO_FONT20_FILE "/fonts/Inter-Regular20.vlw"
-#define ROBOTO_FONT24_NAME "/fonts/Inter-Regular24"
-#define ROBOTO_FONT24_FILE "/fonts/Inter-Regular24.vlw"
+#define ROBOTO_FONT10_NAME "/fonts/Roboto10"
+#define ROBOTO_FONT10_FILE "/fonts/Roboto10.vlw"
+#define ROBOTO_FONT12_NAME "/fonts/Roboto12"
+#define ROBOTO_FONT12_FILE "/fonts/Roboto12.vlw"
+#define ROBOTO_FONT20_NAME "/fonts/Roboto20"
+#define ROBOTO_FONT20_FILE "/fonts/Roboto20.vlw"
+
 
 enum TrKey : uint8_t {
   TR_TIME_SHORT = 0,
@@ -494,8 +494,9 @@ static int getAprsTableMaxRows() {
 static uint16_t getAprsCallsignColorForEnlarged(const APRSStation &station) {
   String symbolShort = getAPRSSymbolShort(station);
   if (symbolShort == "HOUSE") return TFT_YELLOW;
-  if (symbolShort == "HUMAN") return TFT_BLUE;
+  if (symbolShort == "HUMAN") return 0x3C1F;
   if (symbolShort == "CAR") return TFT_RED;
+  if (symbolShort == "HAMCLOCK") return TFT_ORANGE;
   return TFT_WHITE;
 }
 #endif
@@ -513,19 +514,22 @@ enum Screen2FilterMode {
   FILTER_MODE_SSB = 2,
   FILTER_MODE_DIGI = 3
 };
-Screen2FilterMode screen2FilterMode = FILTER_MODE_ALL;
-int screen2FilterBandIndex = 0; // 0 = ALL
+const uint8_t FILTER_MODE_BIT_CW = 1 << 0;
+const uint8_t FILTER_MODE_BIT_SSB = 1 << 1;
+const uint8_t FILTER_MODE_BIT_DIGI = 1 << 2;
+uint8_t screen2FilterModeMask = 0;
+uint16_t screen2FilterBandMask = 0; // 0 = ALL
 const char *SCREEN2_FILTER_BANDS[] = {"ALL", "160m", "80m", "40m", "20m", "17m", "15m", "12m", "10m"};
 const int SCREEN2_FILTER_BANDS_COUNT = sizeof(SCREEN2_FILTER_BANDS) / sizeof(SCREEN2_FILTER_BANDS[0]);
 const size_t COUNTRY_COL_MAX_LEN = 19;
 
 // Filtry ekranu 7 (POTA)
-Screen2FilterMode screen7FilterMode = FILTER_MODE_ALL;
-int screen7FilterBandIndex = 0; // 0 = ALL
+uint8_t screen7FilterModeMask = 0;
+uint16_t screen7FilterBandMask = 0; // 0 = ALL
 
 // Filtry ekranu 8 (HAMALERT)
-Screen2FilterMode screen8FilterMode = FILTER_MODE_ALL;
-int screen8FilterBandIndex = 0; // 0 = ALL
+uint8_t screen8FilterModeMask = 0;
+uint16_t screen8FilterBandMask = 0; // 0 = ALL
 const char *SCREEN8_FILTER_BANDS[] = {"ALL", "160m", "80m", "40m", "20m", "17m", "15m", "12m", "10m", "VHF", "UHF", "SHF"};
 const int SCREEN8_FILTER_BANDS_COUNT = sizeof(SCREEN8_FILTER_BANDS) / sizeof(SCREEN8_FILTER_BANDS[0]);
 
@@ -604,7 +608,7 @@ int touchCalNewYMax = TOUCH_Y_MAX;
 #define MAX_SPOTS 50  // Bufor 50 ostatnich spotów
 #define MAX_POTA_SPOTS 30  // Bufor 30 ostatnich spotów (TFT pokaże max 10)
 #define GMT_OFFSET_SEC 0  // UTC
-#define DEFAULT_TIMEZONE_HOURS 0
+#define DEFAULT_TIMEZONE_HOURS 0.0f
 #define DEFAULT_CALLSIGN "SWL"
 #define DEFAULT_OPENWEBRX_URL "http://okno.ddns.net:8078"
 #define PROPAGATION_URL "https://www.hamqsl.com/solarxml.php"
@@ -662,6 +666,7 @@ struct PropagationData {
   String sfi;
   String kindex;
   String aindex;
+  String muf;
   String updated;
   String hfBandLabel[4];
   String hfBandFreq[4];
@@ -747,6 +752,8 @@ int potaSpotCount = 0;
 DXSpot hamalertSpots[MAX_POTA_SPOTS];
 int hamalertSpotCount = 0;
 SemaphoreHandle_t dxSpotsMutex = nullptr;
+SemaphoreHandle_t potaSpotsMutex = nullptr;
+SemaphoreHandle_t hamalertSpotsMutex = nullptr;
 
 const size_t DX_TIME_MAX_LEN = 24;
 const size_t DX_CALLSIGN_MAX_LEN = 16;
@@ -799,6 +806,30 @@ static inline void unlockDxSpots() {
   }
 }
 
+static inline void lockPotaSpots() {
+  if (potaSpotsMutex != nullptr) {
+    xSemaphoreTake(potaSpotsMutex, portMAX_DELAY);
+  }
+}
+
+static inline void unlockPotaSpots() {
+  if (potaSpotsMutex != nullptr) {
+    xSemaphoreGive(potaSpotsMutex);
+  }
+}
+
+static inline void lockHamalertSpots() {
+  if (hamalertSpotsMutex != nullptr) {
+    xSemaphoreTake(hamalertSpotsMutex, portMAX_DELAY);
+  }
+}
+
+static inline void unlockHamalertSpots() {
+  if (hamalertSpotsMutex != nullptr) {
+    xSemaphoreGive(hamalertSpotsMutex);
+  }
+}
+
 // Formatuje czas spotu do postaci "HH:MM" niezależnie od wejściowego formatu
 String formatSpotUtc(String raw) {
   raw.trim();
@@ -847,7 +878,7 @@ unsigned long lastHamalertFetchMs = 0;
 #define DEFAULT_APRS_PASSCODE 00000
 #define DEFAULT_APRS_SSID 0
 #define DEFAULT_APRS_FILTER_RADIUS 50  // Promień w km (domyślnie 50, zakres 1-50)
-#define MAX_APRS_STATIONS 20  // Maksymalna liczba stacji do wyświetlenia (bufor dla WWW)
+#define MAX_APRS_STATIONS 30  // Maksymalna liczba stacji do wyświetlenia (bufor dla WWW)
 #define MAX_APRS_DISPLAY_LCD 11  // Maksymalna liczba stacji na ekranie LCD
 
 // Zmienne konfiguracyjne APRS-IS
@@ -880,8 +911,8 @@ unsigned long lastAPRSPositionTxMs = 0;
 unsigned long nextAPRSPositionDueMs = 0;
 int aprsIntervalMinutes = DEFAULT_APRS_INTERVAL_MIN;
 const char DEFAULT_APRS_SYMBOL_TABLE = '/';
-const char DEFAULT_APRS_SYMBOL_CODE = '-';
-String aprsSymbolTwoChar = "/-";
+const char DEFAULT_APRS_SYMBOL_CODE = 'V';
+String aprsSymbolTwoChar = "/V";
 char aprsSymbolTable = DEFAULT_APRS_SYMBOL_TABLE;
 char aprsSymbolCode = DEFAULT_APRS_SYMBOL_CODE;
 String aprsUserComment = "";
@@ -951,7 +982,7 @@ String userLocator = "";
 double userLat = 0.0;
 double userLon = 0.0;
 bool userLatLonValid = false;
-int timezoneHours = DEFAULT_TIMEZONE_HOURS;
+float timezoneHours = DEFAULT_TIMEZONE_HOURS;
 String qrzUsername = "";
 String qrzPassword = "";
 String qrzStatus = "QRZ: not configured";
@@ -962,8 +993,10 @@ String openWebRxUrl = DEFAULT_OPENWEBRX_URL;
 bool clusterNoAnnouncements = true;      // set/noann - wyłącz ogłoszenia
 bool clusterNoWWV = true;                // set/nowwv - wyłącz WWV
 bool clusterNoWCY = true;                // set/nowcy - wyłącz WCY
-bool clusterUseFilters = false;           // Czy używać filtrów (set/filter)
-String clusterFilterCommands = "";        // Dodatkowe komendy filtrĂłw (np. "set/filter k,ve/pass")
+bool clusterUseFilters = true;            // Czy używać filtrów (set/filter)
+String clusterFilterCommands = "set/ft8"; // Domyślna komenda filtra dla nowej konfiguracji
+// Preferences/NVS key max length on ESP32 is 15 chars.
+const char* NVS_KEY_CLUSTER_USEFILTERS = "cluster_usefl";
 
 // Status poĹ‚Ä…czenia
 bool wifiConnected = false;
@@ -971,7 +1004,13 @@ bool telnetConnected = false;
 unsigned long lastTelnetAttempt = 0;
 unsigned long lastNTPUpdate = 0;
 unsigned long lastWiFiReconnectAttempt = 0;
+unsigned long lastWiFiStaReconnectAttempt = 0;
+unsigned long wifiStaRetryWindowStartMs = 0;
 unsigned long lastPotaAttempt = 0;
+const unsigned long WIFI_AP_RETRY_INTERVAL_MS = 5UL * 60UL * 1000UL; // 5 minut
+const unsigned long WIFI_STA_RETRY_INTERVAL_MS = 20UL * 1000UL; // 20 sekund
+const unsigned long WIFI_STA_RETRY_WINDOW_MS = 10UL * 60UL * 1000UL; // maks. 10 minut prób w STA
+const uint8_t WIFI_STA_RECONNECT_ATTEMPTS = 6; // 6 * 500ms = ~3s na SSID (mniej blokujące)
 
 const uint8_t RGB_LED_RED_PIN = 4;
 const uint8_t RGB_LED_GREEN_PIN = 16;
@@ -1142,23 +1181,23 @@ void drawWelcomeScreenYellow() {
     return;
   }
   tft.fillScreen(TFT_BLACK);
+  // Optional startup background from LittleFS (data/logo.bmp)
+  drawBmpFromFS("/logo.bmp", 0, 0);
   tft.setTextSize(1);
   const int centerX = 160;
   const int startY = 40;
   const int lineGap = 16;
   String lines[] = {
     "ESP32-HAM-CLOCK",
-    "version 1.2",
+    "version 1.2.2",
     "Created by SP3KON",
     "(AI-assisted)",
     "sp3kon@gmail.com",
     ""
   };
   for (int i = 0; i < 6; i++) {
-    int textWidth = lines[i].length() * 12;
-    int x = centerX - (textWidth / 2);
-    tft.setTextColor(TFT_YELLOW);
-    tft.setCursor(x, startY + i * lineGap);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.setCursor(5, startY + i * lineGap);
     tft.print(lines[i]);
   }
 }
@@ -1176,7 +1215,7 @@ void drawWelcomeScreenGreen() {
   String line = "FOLLOW THE PROPAGATION...";
   int textWidth = line.length() * 12;
   int x = centerX - (textWidth / 2);
-  tft.setCursor(x, startY + 6 * lineGap);
+  tft.setCursor(x, startY + 6 * lineGap + 25);
   tft.print(line);
 }
 
@@ -1547,7 +1586,7 @@ bool getTimeWithTimezone(struct tm *outTm) {
   if (now < 100000) {
     return false;
   }
-  now += (time_t)timezoneHours * 3600;
+  now += (time_t)(timezoneHours * 3600.0f);
   gmtime_r(&now, outTm);
   return true;
 }
@@ -1571,7 +1610,7 @@ String formatAprsTimeWithTimezone(String timeStr) {
   }
   int hour = timeStr.substring(0, 2).toInt();
   int minute = timeStr.substring(2, 4).toInt();
-  int hourLocal = hour + timezoneHours;
+  int hourLocal = hour + (int)timezoneHours;
   while (hourLocal < 0) hourLocal += 24;
   while (hourLocal >= 24) hourLocal -= 24;
   String hh = (hourLocal < 10 ? "0" : "") + String(hourLocal);
@@ -2021,61 +2060,139 @@ void updateScreen2Clock() {
 }
 
 bool spotMatchesScreen2Filters(const DXSpot &spot) {
-  if (screen2FilterMode != FILTER_MODE_ALL) {
-    if (screen2FilterMode == FILTER_MODE_CW && spot.mode != "CW") return false;
-    if (screen2FilterMode == FILTER_MODE_SSB && spot.mode != "SSB") return false;
-    if (screen2FilterMode == FILTER_MODE_DIGI && !(spot.mode == "FT8" || spot.mode == "FT4")) return false;
-  }
-  if (screen2FilterBandIndex > 0 && screen2FilterBandIndex < SCREEN8_FILTER_BANDS_COUNT) {
-    String selectedBand = SCREEN8_FILTER_BANDS[screen2FilterBandIndex];
-    float freqMHz = spot.frequency;
+  return spotMatchesModeFilter(spot.mode, screen2FilterModeMask) &&
+         spotMatchesBandFilter(spot, screen2FilterBandMask, SCREEN8_FILTER_BANDS, SCREEN8_FILTER_BANDS_COUNT);
+}
 
+uint8_t getModeFilterBitForIndex(int index) {
+  switch (index) {
+    case FILTER_MODE_CW:
+      return FILTER_MODE_BIT_CW;
+    case FILTER_MODE_SSB:
+      return FILTER_MODE_BIT_SSB;
+    case FILTER_MODE_DIGI:
+      return FILTER_MODE_BIT_DIGI;
+    default:
+      return 0;
+  }
+}
+
+uint16_t getBandFilterBitForIndex(int index) {
+  if (index <= 0 || index >= 16) {
+    return 0;
+  }
+  return (uint16_t)1u << (index - 1);
+}
+
+bool isModeFilterTileSelected(uint8_t mask, int index) {
+  if (index == FILTER_MODE_ALL) {
+    return mask == 0;
+  }
+  return (mask & getModeFilterBitForIndex(index)) != 0;
+}
+
+bool isBandFilterTileSelected(uint16_t mask, int index) {
+  if (index == 0) {
+    return mask == 0;
+  }
+  return (mask & getBandFilterBitForIndex(index)) != 0;
+}
+
+void toggleModeFilterSelection(uint8_t &mask, int index) {
+  if (index == FILTER_MODE_ALL) {
+    mask = 0;
+    return;
+  }
+
+  uint8_t bit = getModeFilterBitForIndex(index);
+  if (bit == 0) {
+    return;
+  }
+
+  mask ^= bit;
+}
+
+void toggleBandFilterSelection(uint16_t &mask, int index) {
+  if (index == 0) {
+    mask = 0;
+    return;
+  }
+
+  uint16_t bit = getBandFilterBitForIndex(index);
+  if (bit == 0) {
+    return;
+  }
+
+  mask ^= bit;
+}
+
+bool spotMatchesModeFilter(const String &modeRaw, uint8_t mask) {
+  if (mask == 0) {
+    return true;
+  }
+
+  String mode = modeRaw;
+  mode.toUpperCase();
+
+  if ((mask & FILTER_MODE_BIT_CW) && mode == "CW") {
+    return true;
+  }
+  if ((mask & FILTER_MODE_BIT_SSB) && mode == "SSB") {
+    return true;
+  }
+  if ((mask & FILTER_MODE_BIT_DIGI) && (mode == "FT8" || mode == "FT4")) {
+    return true;
+  }
+  return false;
+}
+
+bool spotMatchesBandFilter(const DXSpot &spot, uint16_t mask, const char **bands, int bandCount) {
+  if (mask == 0) {
+    return true;
+  }
+
+  float freqMHz = spot.frequency;
+  for (int index = 1; index < bandCount; index++) {
+    uint16_t bit = getBandFilterBitForIndex(index);
+    if ((mask & bit) == 0) {
+      continue;
+    }
+
+    String selectedBand = bands[index];
     if (selectedBand == "VHF") {
-      if (!(freqMHz >= 30.0f && freqMHz < 300.0f)) return false;
-    } else if (selectedBand == "UHF") {
-      if (!(freqMHz >= 300.0f && freqMHz < 3000.0f)) return false;
-    } else if (selectedBand == "SHF") {
-      if (!(freqMHz >= 3000.0f && freqMHz < 30000.0f)) return false;
-    } else {
-      if (spot.band != selectedBand) return false;
+      if (freqMHz >= 30.0f && freqMHz < 300.0f) {
+        return true;
+      }
+      continue;
+    }
+    if (selectedBand == "UHF") {
+      if (freqMHz >= 300.0f && freqMHz < 3000.0f) {
+        return true;
+      }
+      continue;
+    }
+    if (selectedBand == "SHF") {
+      if (freqMHz >= 3000.0f && freqMHz < 30000.0f) {
+        return true;
+      }
+      continue;
+    }
+    if (spot.band == selectedBand) {
+      return true;
     }
   }
-  return true;
+
+  return false;
 }
 
 bool spotMatchesScreen7Filters(const DXSpot &spot) {
-  if (screen7FilterMode != FILTER_MODE_ALL) {
-    if (screen7FilterMode == FILTER_MODE_CW && spot.mode != "CW") return false;
-    if (screen7FilterMode == FILTER_MODE_SSB && spot.mode != "SSB") return false;
-    if (screen7FilterMode == FILTER_MODE_DIGI && !(spot.mode == "FT8" || spot.mode == "FT4")) return false;
-  }
-  if (screen7FilterBandIndex > 0 && screen7FilterBandIndex < SCREEN2_FILTER_BANDS_COUNT) {
-    if (spot.band != SCREEN2_FILTER_BANDS[screen7FilterBandIndex]) return false;
-  }
-  return true;
+  return spotMatchesModeFilter(spot.mode, screen7FilterModeMask) &&
+         spotMatchesBandFilter(spot, screen7FilterBandMask, SCREEN2_FILTER_BANDS, SCREEN2_FILTER_BANDS_COUNT);
 }
 
 bool spotMatchesScreen8Filters(const DXSpot &spot) {
-  if (screen8FilterMode != FILTER_MODE_ALL) {
-    if (screen8FilterMode == FILTER_MODE_CW && spot.mode != "CW") return false;
-    if (screen8FilterMode == FILTER_MODE_SSB && spot.mode != "SSB") return false;
-    if (screen8FilterMode == FILTER_MODE_DIGI && !(spot.mode == "FT8" || spot.mode == "FT4")) return false;
-  }
-  if (screen8FilterBandIndex > 0 && screen8FilterBandIndex < SCREEN8_FILTER_BANDS_COUNT) {
-    String selectedBand = SCREEN8_FILTER_BANDS[screen8FilterBandIndex];
-    float freqMHz = spot.frequency;
-
-    if (selectedBand == "VHF") {
-      if (!(freqMHz >= 30.0f && freqMHz < 300.0f)) return false;
-    } else if (selectedBand == "UHF") {
-      if (!(freqMHz >= 300.0f && freqMHz < 3000.0f)) return false;
-    } else if (selectedBand == "SHF") {
-      if (!(freqMHz >= 3000.0f && freqMHz < 30000.0f)) return false;
-    } else {
-      if (spot.band != selectedBand) return false;
-    }
-  }
-  return true;
+  return spotMatchesModeFilter(spot.mode, screen8FilterModeMask) &&
+         spotMatchesBandFilter(spot, screen8FilterBandMask, SCREEN8_FILTER_BANDS, SCREEN8_FILTER_BANDS_COUNT);
 }
 
 float getAprsSortDistance(const APRSStation &s) {
@@ -2143,9 +2260,9 @@ uint32_t computeScreen2Signature() {
   lockDxSpots();
   hash ^= (uint32_t)spotCount;
   hash *= fnvPrime;
-  hash ^= (uint32_t)screen2FilterMode;
+  hash ^= (uint32_t)screen2FilterModeMask;
   hash *= fnvPrime;
-  hash ^= (uint32_t)screen2FilterBandIndex;
+  hash ^= (uint32_t)screen2FilterBandMask;
   hash *= fnvPrime;
   hash ^= (uint32_t)dxTableSizeMode;
   hash *= fnvPrime;
@@ -2229,14 +2346,14 @@ void updateScreen2Data() {
     if (enlarged) {
       tableSprite->setCursor(5, yPos);   tableSprite->print("UTC");
       tableSprite->setCursor(74, yPos);  tableSprite->print("CALL");
-      tableSprite->setCursor(204, yPos); tableSprite->print("MHz");
-      tableSprite->setCursor(282, yPos); tableSprite->print("MODE");
+      tableSprite->setCursor(191, yPos); tableSprite->print("MHz");
+      tableSprite->setCursor(274, yPos); tableSprite->print("MODE");
     } else {
       tableSprite->setCursor(5, yPos);   tableSprite->print("UTC");
       tableSprite->setCursor(50, yPos);  tableSprite->print("CALLSIGN");
       tableSprite->setCursor(125, yPos); tableSprite->print("MHz");
-      tableSprite->setCursor(190, yPos); tableSprite->print("MODE");
-      tableSprite->setCursor(220, yPos); tableSprite->print(tr(TR_COUNTRY));
+      tableSprite->setCursor(182, yPos); tableSprite->print("MODE");
+      tableSprite->setCursor(212, yPos); tableSprite->print(tr(TR_COUNTRY));
     }
     tableSprite->drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
     yPos += enlarged ? 20 : 18;
@@ -2267,11 +2384,11 @@ void updateScreen2Data() {
         tableSprite->print(callText);
 
         tableSprite->setTextColor(TFT_YELLOW);
-        tableSprite->setCursor(204, yPos);
+        tableSprite->setCursor(191, yPos);
         tableSprite->print(spots[i].frequency / 1000.0, 3);
 
         tableSprite->setTextColor(TFT_GREEN);
-        tableSprite->setCursor(282, yPos);
+        tableSprite->setCursor(274, yPos);
         String modeText = spots[i].mode;
         if (modeText.length() > 4) modeText = modeText.substring(0, 4);
         tableSprite->print(modeText);
@@ -2297,11 +2414,11 @@ void updateScreen2Data() {
         tableSprite->print(spots[i].frequency / 1000.0, 3);
 
         tableSprite->setTextColor(TFT_GREEN);
-        tableSprite->setCursor(190, yPos);
+        tableSprite->setCursor(182, yPos);
         tableSprite->print(spots[i].mode);
 
         tableSprite->setTextColor(TFT_RADIO_ORANGE);
-        tableSprite->setCursor(220, yPos);
+        tableSprite->setCursor(212, yPos);
         String countryText = formatDistanceOrCountry(spots[i], COUNTRY_COL_MAX_LEN);
         tableSprite->print(countryText);
 
@@ -2331,14 +2448,14 @@ void updateScreen2Data() {
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(204, yPos); tft.print("MHz");
-    tft.setCursor(282, yPos); tft.print("MODE");
+    tft.setCursor(191, yPos); tft.print("MHz");
+    tft.setCursor(274, yPos); tft.print("MODE");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("MHz");
-    tft.setCursor(190, yPos); tft.print("MODE");
-    tft.setCursor(220, yPos); tft.print(tr(TR_COUNTRY));
+    tft.setCursor(182, yPos); tft.print("MODE");
+    tft.setCursor(212, yPos); tft.print(tr(TR_COUNTRY));
   }
   tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
   yPos += enlarged ? 20 : 18;
@@ -2369,11 +2486,11 @@ void updateScreen2Data() {
       tft.print(callText);
 
       tft.setTextColor(TFT_YELLOW);
-      tft.setCursor(204, yPos);
+      tft.setCursor(191, yPos);
       tft.print(spots[i].frequency / 1000.0, 3);
 
       tft.setTextColor(TFT_GREEN);
-      tft.setCursor(282, yPos);
+      tft.setCursor(274, yPos);
       String modeText = spots[i].mode;
       if (modeText.length() > 4) modeText = modeText.substring(0, 4);
       tft.print(modeText);
@@ -2399,11 +2516,11 @@ void updateScreen2Data() {
       tft.print(spots[i].frequency / 1000.0, 3);
 
       tft.setTextColor(TFT_GREEN);
-      tft.setCursor(190, yPos);
+      tft.setCursor(182, yPos);
       tft.print(spots[i].mode);
 
       tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(220, yPos);
+      tft.setCursor(212, yPos);
       String countryText = formatDistanceOrCountry(spots[i], COUNTRY_COL_MAX_LEN);
       tft.print(countryText);
 
@@ -2452,20 +2569,21 @@ void drawPotaCluster() {
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(204, yPos); tft.print("MHz");
-    tft.setCursor(282, yPos); tft.print("MODE");
+    tft.setCursor(191, yPos); tft.print("MHz");
+    tft.setCursor(274, yPos); tft.print("MODE");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("MHz");
-    tft.setCursor(190, yPos); tft.print("MODE");
-    tft.setCursor(220, yPos); tft.print(tr(TR_COUNTRY));
+    tft.setCursor(182, yPos); tft.print("MODE");
+    tft.setCursor(212, yPos); tft.print(tr(TR_COUNTRY));
   }
   tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
   yPos += enlarged ? 20 : 18;
 
   int maxRows = getPotaTableMaxRows();
   int displayCount = 0;
+  lockPotaSpots();
   for (int i = 0; i < potaSpotCount && displayCount < maxRows; i++) {
     if (!spotMatchesScreen7Filters(potaSpots[i])) continue;
     if (enlarged) {
@@ -2483,11 +2601,11 @@ void drawPotaCluster() {
       tft.print(callText);
 
       tft.setTextColor(TFT_YELLOW);
-      tft.setCursor(204, yPos);
+      tft.setCursor(191, yPos);
       tft.print(potaSpots[i].frequency, 3);
 
       tft.setTextColor(TFT_GREEN);
-      tft.setCursor(282, yPos);
+      tft.setCursor(274, yPos);
       String modeText = potaSpots[i].mode;
       if (modeText.length() > 4) modeText = modeText.substring(0, 4);
       tft.print(modeText);
@@ -2517,11 +2635,11 @@ void drawPotaCluster() {
       tft.print(potaSpots[i].frequency, 3); // frequency już w MHz
 
       tft.setTextColor(TFT_GREEN);
-      tft.setCursor(190, yPos);
+      tft.setCursor(182, yPos);
       tft.print(potaSpots[i].mode);
 
       tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(220, yPos);
+      tft.setCursor(212, yPos);
       String countryText = formatDistanceOrCountry(potaSpots[i], COUNTRY_COL_MAX_LEN);
       tft.print(countryText);
 
@@ -2529,6 +2647,7 @@ void drawPotaCluster() {
     }
     displayCount++;
   }
+  unlockPotaSpots();
 
   if (isTableNavFooterVisible(SCREEN_POTA_CLUSTER)) {
     drawSwitchScreenFooter();
@@ -2568,11 +2687,12 @@ uint32_t computeScreen7Signature() {
   const uint32_t fnvPrime = 16777619u;
   uint32_t hash = 2166136261u;
 
+  lockPotaSpots();
   hash ^= (uint32_t)potaSpotCount;
   hash *= fnvPrime;
-  hash ^= (uint32_t)screen7FilterMode;
+  hash ^= (uint32_t)screen7FilterModeMask;
   hash *= fnvPrime;
-  hash ^= (uint32_t)screen7FilterBandIndex;
+  hash ^= (uint32_t)screen7FilterBandMask;
   hash *= fnvPrime;
   hash ^= (uint32_t)dxTableSizeMode;
   hash *= fnvPrime;
@@ -2605,6 +2725,7 @@ uint32_t computeScreen7Signature() {
     }
     displayCount++;
   }
+  unlockPotaSpots();
 
   return hash;
 }
@@ -2640,19 +2761,20 @@ void updateScreen7Data() {
     if (enlarged) {
       tableSprite->setCursor(5, yPos);   tableSprite->print("UTC");
       tableSprite->setCursor(74, yPos);  tableSprite->print("CALL");
-      tableSprite->setCursor(204, yPos); tableSprite->print("MHz");
-      tableSprite->setCursor(282, yPos); tableSprite->print("MODE");
+      tableSprite->setCursor(191, yPos); tableSprite->print("MHz");
+      tableSprite->setCursor(274, yPos); tableSprite->print("MODE");
     } else {
       tableSprite->setCursor(5, yPos);   tableSprite->print("UTC");
       tableSprite->setCursor(50, yPos);  tableSprite->print("CALLSIGN");
       tableSprite->setCursor(125, yPos); tableSprite->print("MHz");
-      tableSprite->setCursor(190, yPos); tableSprite->print("MODE");
-      tableSprite->setCursor(220, yPos); tableSprite->print(tr(TR_COUNTRY));
+      tableSprite->setCursor(182, yPos); tableSprite->print("MODE");
+      tableSprite->setCursor(212, yPos); tableSprite->print(tr(TR_COUNTRY));
     }
     tableSprite->drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
     yPos += enlarged ? 20 : 18;
 
     int displayCount = 0;
+    lockPotaSpots();
     for (int i = 0; i < potaSpotCount && displayCount < maxRows; i++) {
       if (!spotMatchesScreen7Filters(potaSpots[i])) continue;
       if (yPos >= (tableHeight - 2)) {
@@ -2676,11 +2798,11 @@ void updateScreen7Data() {
         tableSprite->print(callText);
 
         tableSprite->setTextColor(TFT_YELLOW);
-        tableSprite->setCursor(204, yPos);
+        tableSprite->setCursor(191, yPos);
         tableSprite->print(potaSpots[i].frequency, 3);
 
         tableSprite->setTextColor(TFT_GREEN);
-        tableSprite->setCursor(282, yPos);
+        tableSprite->setCursor(274, yPos);
         String modeText = potaSpots[i].mode;
         if (modeText.length() > 4) modeText = modeText.substring(0, 4);
         tableSprite->print(modeText);
@@ -2712,11 +2834,11 @@ void updateScreen7Data() {
         tableSprite->print(potaSpots[i].frequency, 3);
 
         tableSprite->setTextColor(TFT_GREEN);
-        tableSprite->setCursor(190, yPos);
+        tableSprite->setCursor(182, yPos);
         tableSprite->print(potaSpots[i].mode);
 
         tableSprite->setTextColor(TFT_RADIO_ORANGE);
-        tableSprite->setCursor(220, yPos);
+        tableSprite->setCursor(212, yPos);
         String countryText = formatDistanceOrCountry(potaSpots[i], COUNTRY_COL_MAX_LEN);
         tableSprite->print(countryText);
 
@@ -2724,6 +2846,7 @@ void updateScreen7Data() {
       }
       displayCount++;
     }
+    unlockPotaSpots();
 
     if (displayCount == 0) {
       tableSprite->setTextColor(TFT_RED);
@@ -2745,19 +2868,20 @@ void updateScreen7Data() {
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(204, yPos); tft.print("MHz");
-    tft.setCursor(282, yPos); tft.print("MODE");
+    tft.setCursor(191, yPos); tft.print("MHz");
+    tft.setCursor(274, yPos); tft.print("MODE");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("MHz");
-    tft.setCursor(190, yPos); tft.print("MODE");
-    tft.setCursor(220, yPos); tft.print(tr(TR_COUNTRY));
+    tft.setCursor(182, yPos); tft.print("MODE");
+    tft.setCursor(212, yPos); tft.print(tr(TR_COUNTRY));
   }
   tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
   yPos += enlarged ? 20 : 18;
 
   int displayCount = 0;
+  lockPotaSpots();
   for (int i = 0; i < potaSpotCount && displayCount < maxRows; i++) {
     if (!spotMatchesScreen7Filters(potaSpots[i])) continue;
     if (yPos >= (tableBottom - 2)) {
@@ -2781,11 +2905,11 @@ void updateScreen7Data() {
       tft.print(callText);
 
       tft.setTextColor(TFT_YELLOW);
-      tft.setCursor(204, yPos);
+      tft.setCursor(191, yPos);
       tft.print(potaSpots[i].frequency, 3);
 
       tft.setTextColor(TFT_GREEN);
-      tft.setCursor(282, yPos);
+      tft.setCursor(274, yPos);
       String modeText = potaSpots[i].mode;
       if (modeText.length() > 4) modeText = modeText.substring(0, 4);
       tft.print(modeText);
@@ -2817,11 +2941,11 @@ void updateScreen7Data() {
       tft.print(potaSpots[i].frequency, 3);
 
       tft.setTextColor(TFT_GREEN);
-      tft.setCursor(190, yPos);
+      tft.setCursor(182, yPos);
       tft.print(potaSpots[i].mode);
 
       tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(220, yPos);
+      tft.setCursor(212, yPos);
       String countryText = formatDistanceOrCountry(potaSpots[i], COUNTRY_COL_MAX_LEN);
       tft.print(countryText);
 
@@ -2829,6 +2953,7 @@ void updateScreen7Data() {
     }
     displayCount++;
   }
+  unlockPotaSpots();
 
   if (displayCount == 0) {
     tft.setTextColor(TFT_RED);
@@ -2891,20 +3016,21 @@ void drawHamalertCluster() {
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(204, yPos); tft.print("MHz");
-    tft.setCursor(282, yPos); tft.print("MODE");
+    tft.setCursor(191, yPos); tft.print("MHz");
+    tft.setCursor(274, yPos); tft.print("MODE");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("MHz");
-    tft.setCursor(190, yPos); tft.print("MODE");
-    tft.setCursor(220, yPos); tft.print(tr(TR_COUNTRY));
+    tft.setCursor(182, yPos); tft.print("MODE");
+    tft.setCursor(212, yPos); tft.print(tr(TR_COUNTRY));
   }
   tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
   yPos += enlarged ? 20 : 18;
 
   const int maxRows = getHamalertTableMaxRows();
   int displayCount = 0;
+  lockHamalertSpots();
   for (int i = 0; i < hamalertSpotCount && displayCount < maxRows; i++) {
     if (!spotMatchesScreen8Filters(hamalertSpots[i])) {
       continue;
@@ -2927,11 +3053,11 @@ void drawHamalertCluster() {
       tft.print(callText);
 
       tft.setTextColor(TFT_YELLOW);
-      tft.setCursor(204, yPos);
+      tft.setCursor(191, yPos);
       tft.print(hamalertSpots[i].frequency, 3);
 
       tft.setTextColor(TFT_GREEN);
-      tft.setCursor(282, yPos);
+      tft.setCursor(274, yPos);
       String modeText = hamalertSpots[i].mode;
       if (modeText.length() > 4) modeText = modeText.substring(0, 4);
       tft.print(modeText);
@@ -2957,11 +3083,11 @@ void drawHamalertCluster() {
       tft.print(hamalertSpots[i].frequency, 3);
 
       tft.setTextColor(TFT_GREEN);
-      tft.setCursor(190, yPos);
+      tft.setCursor(182, yPos);
       tft.print(hamalertSpots[i].mode);
 
       tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(220, yPos);
+      tft.setCursor(212, yPos);
       String countryText = formatDistanceOrCountry(hamalertSpots[i], COUNTRY_COL_MAX_LEN);
       tft.print(countryText);
 
@@ -2969,6 +3095,7 @@ void drawHamalertCluster() {
     }
     displayCount++;
   }
+  unlockHamalertSpots();
 
   if (displayCount == 0) {
     tft.setTextColor(TFT_RED);
@@ -3004,11 +3131,12 @@ uint32_t computeScreen8Signature() {
   const uint32_t fnvPrime = 16777619u;
   uint32_t hash = 2166136261u;
 
+  lockHamalertSpots();
   hash ^= (uint32_t)hamalertSpotCount;
   hash *= fnvPrime;
-  hash ^= (uint32_t)screen8FilterMode;
+  hash ^= (uint32_t)screen8FilterModeMask;
   hash *= fnvPrime;
-  hash ^= (uint32_t)screen8FilterBandIndex;
+  hash ^= (uint32_t)screen8FilterBandMask;
   hash *= fnvPrime;
   hash ^= (uint32_t)dxTableSizeMode;
   hash *= fnvPrime;
@@ -3042,6 +3170,7 @@ uint32_t computeScreen8Signature() {
     }
     displayCount++;
   }
+  unlockHamalertSpots();
 
   return hash;
 }
@@ -3074,19 +3203,20 @@ void updateScreen8Data() {
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(204, yPos); tft.print("MHz");
-    tft.setCursor(282, yPos); tft.print("MODE");
+    tft.setCursor(191, yPos); tft.print("MHz");
+    tft.setCursor(274, yPos); tft.print("MODE");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("MHz");
-    tft.setCursor(190, yPos); tft.print("MODE");
-    tft.setCursor(220, yPos); tft.print(tr(TR_COUNTRY));
+    tft.setCursor(182, yPos); tft.print("MODE");
+    tft.setCursor(212, yPos); tft.print(tr(TR_COUNTRY));
   }
   tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
   yPos += enlarged ? 20 : 18;
 
   int displayCount = 0;
+  lockHamalertSpots();
   for (int i = 0; i < hamalertSpotCount && displayCount < maxRows; i++) {
     if (!spotMatchesScreen8Filters(hamalertSpots[i])) {
       continue;
@@ -3112,11 +3242,11 @@ void updateScreen8Data() {
       tft.print(callText);
 
       tft.setTextColor(TFT_YELLOW);
-      tft.setCursor(204, yPos);
+      tft.setCursor(191, yPos);
       tft.print(hamalertSpots[i].frequency, 3);
 
       tft.setTextColor(TFT_GREEN);
-      tft.setCursor(282, yPos);
+      tft.setCursor(274, yPos);
       String modeText = hamalertSpots[i].mode;
       if (modeText.length() > 4) modeText = modeText.substring(0, 4);
       tft.print(modeText);
@@ -3142,11 +3272,11 @@ void updateScreen8Data() {
       tft.print(hamalertSpots[i].frequency, 3);
 
       tft.setTextColor(TFT_GREEN);
-      tft.setCursor(190, yPos);
+      tft.setCursor(182, yPos);
       tft.print(hamalertSpots[i].mode);
 
       tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(220, yPos);
+      tft.setCursor(212, yPos);
       String countryText = formatDistanceOrCountry(hamalertSpots[i], COUNTRY_COL_MAX_LEN);
       tft.print(countryText);
 
@@ -3154,6 +3284,7 @@ void updateScreen8Data() {
     }
     displayCount++;
   }
+  unlockHamalertSpots();
 
   if (displayCount == 0) {
     tft.setTextColor(TFT_RED);
@@ -3581,12 +3712,18 @@ void handleTouchNavigation() {
       currentScreen = getPrevScreenId(currentScreen);
       drawScreen(currentScreen);
       resetTftAutoSwitchTimer();
+      autoswitchPausedUntilMs = 0;
       LOGV_PRINTF("[TOUCH] Ekran zmieniony na: %d (tap left)\n", currentScreen);
     } else if (y >= cornerY && x >= (320 - cornerX)) {
       currentScreen = getNextScreenId(currentScreen);
       drawScreen(currentScreen);
       resetTftAutoSwitchTimer();
+      autoswitchPausedUntilMs = 0;
       LOGV_PRINTF("[TOUCH] Ekran zmieniony na: %d (tap right)\n", currentScreen);
+    } else if (y >= cornerY && x >= cornerX && x < (320 - cornerX)) {
+      // środek ekranu: pauzuj autoswitch na 10 sekund
+      autoswitchPausedUntilMs = millis() + 10000UL;
+      LOGV_PRINTF("[TOUCH] Autoswitch zapauzowany na 10s (tap center)\n");
     }
   } else {
     touchActive = false;
@@ -3633,14 +3770,14 @@ tft.print(clusterHost);
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(204, yPos); tft.print("MHz");
-    tft.setCursor(282, yPos); tft.print("MODE");
+    tft.setCursor(191, yPos); tft.print("MHz");
+    tft.setCursor(274, yPos); tft.print("MODE");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("MHz");
-    tft.setCursor(190, yPos); tft.print("MODE");
-    tft.setCursor(220, yPos); tft.print(tr(TR_COUNTRY));
+    tft.setCursor(182, yPos); tft.print("MODE");
+    tft.setCursor(212, yPos); tft.print(tr(TR_COUNTRY));
   }
   tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
   yPos += enlarged ? 20 : 18;
@@ -3667,11 +3804,11 @@ tft.print(clusterHost);
       tft.print(callText);
 
       tft.setTextColor(TFT_YELLOW);
-      tft.setCursor(204, yPos);
+      tft.setCursor(191, yPos);
       tft.print(spots[i].frequency / 1000.0, 3);
 
       tft.setTextColor(TFT_GREEN);
-      tft.setCursor(282, yPos);
+      tft.setCursor(274, yPos);
       String modeText = spots[i].mode;
       if (modeText.length() > 4) modeText = modeText.substring(0, 4);
       tft.print(modeText);
@@ -3693,11 +3830,11 @@ tft.print(clusterHost);
       tft.print(spots[i].frequency / 1000.0, 3);
 
       tft.setTextColor(TFT_GREEN);
-      tft.setCursor(190, yPos);
+      tft.setCursor(182, yPos);
       tft.print(spots[i].mode);
 
       tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(220, yPos);
+      tft.setCursor(212, yPos);
       String countryText = formatDistanceOrCountry(spots[i], COUNTRY_COL_MAX_LEN);
       tft.print(countryText);
 
@@ -3868,7 +4005,8 @@ static uint16_t getAprsRadarColorForStation(const APRSStation &station) {
   String symbolShort = getAPRSSymbolShort(station);
   if (symbolShort == "CAR") return TFT_RED;
   if (symbolShort == "HOUSE") return TFT_YELLOW;
-  if (symbolShort == "HUMAN") return TFT_BLUE;
+  if (symbolShort == "HUMAN") return 0x3C1F;
+  if (symbolShort == "HAMCLOCK") return TFT_ORANGE;
   return TFT_GREEN;
 }
 
@@ -4041,10 +4179,10 @@ void drawDxClusterFilterMenu() {
   const int modeGap = 6;
   const int modeStartX = (320 - (4 * modeTileW + 3 * modeGap)) / 2;
   const int modeY = 40;
-  drawFilterTile(modeStartX + 0 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "ALL", screen2FilterMode == FILTER_MODE_ALL);
-  drawFilterTile(modeStartX + 1 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "CW", screen2FilterMode == FILTER_MODE_CW);
-  drawFilterTile(modeStartX + 2 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "SSB", screen2FilterMode == FILTER_MODE_SSB);
-  drawFilterTile(modeStartX + 3 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "DIGI", screen2FilterMode == FILTER_MODE_DIGI);
+  drawFilterTile(modeStartX + 0 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "ALL", isModeFilterTileSelected(screen2FilterModeMask, FILTER_MODE_ALL));
+  drawFilterTile(modeStartX + 1 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "CW", isModeFilterTileSelected(screen2FilterModeMask, FILTER_MODE_CW));
+  drawFilterTile(modeStartX + 2 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "SSB", isModeFilterTileSelected(screen2FilterModeMask, FILTER_MODE_SSB));
+  drawFilterTile(modeStartX + 3 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "DIGI", isModeFilterTileSelected(screen2FilterModeMask, FILTER_MODE_DIGI));
 
   tft.setTextColor(TFT_LIGHTGREY);
   tft.setCursor(10, 82);
@@ -4061,7 +4199,7 @@ void drawDxClusterFilterMenu() {
       if (bandIdx >= SCREEN8_FILTER_BANDS_COUNT) break;
       int x = bandStartX + col * (bandTileW + bandGap);
       int y = bandStartY + row * (bandTileH + bandGap);
-      drawFilterTile(x, y, bandTileW, bandTileH, SCREEN8_FILTER_BANDS[bandIdx], screen2FilterBandIndex == bandIdx);
+      drawFilterTile(x, y, bandTileW, bandTileH, SCREEN8_FILTER_BANDS[bandIdx], isBandFilterTileSelected(screen2FilterBandMask, bandIdx));
       bandIdx++;
     }
   }
@@ -4083,7 +4221,7 @@ void handleScreen2MenuTouch(uint16_t x, uint16_t y) {
   for (int i = 0; i < 4; i++) {
     int rx = modeStartX + i * (modeTileW + modeGap);
     if (isPointInRect(x, y, rx, modeY, modeTileW, modeTileH)) {
-      screen2FilterMode = (Screen2FilterMode)i;
+      toggleModeFilterSelection(screen2FilterModeMask, i);
       drawDxClusterFilterMenu();
       return;
     }
@@ -4101,7 +4239,7 @@ void handleScreen2MenuTouch(uint16_t x, uint16_t y) {
       int rx = bandStartX + col * (bandTileW + bandGap);
       int ry = bandStartY + row * (bandTileH + bandGap);
       if (isPointInRect(x, y, rx, ry, bandTileW, bandTileH)) {
-        screen2FilterBandIndex = bandIdx;
+        toggleBandFilterSelection(screen2FilterBandMask, bandIdx);
         drawDxClusterFilterMenu();
         return;
       }
@@ -4250,10 +4388,10 @@ void drawPotaFilterMenu() {
   const int modeGap = 6;
   const int modeStartX = (320 - (4 * modeTileW + 3 * modeGap)) / 2;
   const int modeY = 40;
-  drawFilterTile(modeStartX + 0 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "ALL", screen7FilterMode == FILTER_MODE_ALL);
-  drawFilterTile(modeStartX + 1 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "CW", screen7FilterMode == FILTER_MODE_CW);
-  drawFilterTile(modeStartX + 2 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "SSB", screen7FilterMode == FILTER_MODE_SSB);
-  drawFilterTile(modeStartX + 3 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "DIGI", screen7FilterMode == FILTER_MODE_DIGI);
+  drawFilterTile(modeStartX + 0 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "ALL", isModeFilterTileSelected(screen7FilterModeMask, FILTER_MODE_ALL));
+  drawFilterTile(modeStartX + 1 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "CW", isModeFilterTileSelected(screen7FilterModeMask, FILTER_MODE_CW));
+  drawFilterTile(modeStartX + 2 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "SSB", isModeFilterTileSelected(screen7FilterModeMask, FILTER_MODE_SSB));
+  drawFilterTile(modeStartX + 3 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "DIGI", isModeFilterTileSelected(screen7FilterModeMask, FILTER_MODE_DIGI));
 
   tft.setTextColor(TFT_LIGHTGREY);
   tft.setCursor(10, 82);
@@ -4270,7 +4408,7 @@ void drawPotaFilterMenu() {
       if (bandIdx >= SCREEN2_FILTER_BANDS_COUNT) break;
       int x = bandStartX + col * (bandTileW + bandGap);
       int y = bandStartY + row * (bandTileH + bandGap);
-      drawFilterTile(x, y, bandTileW, bandTileH, SCREEN2_FILTER_BANDS[bandIdx], screen7FilterBandIndex == bandIdx);
+      drawFilterTile(x, y, bandTileW, bandTileH, SCREEN2_FILTER_BANDS[bandIdx], isBandFilterTileSelected(screen7FilterBandMask, bandIdx));
       bandIdx++;
     }
   }
@@ -4292,7 +4430,7 @@ void handleScreen7MenuTouch(uint16_t x, uint16_t y) {
   for (int i = 0; i < 4; i++) {
     int rx = modeStartX + i * (modeTileW + modeGap);
     if (isPointInRect(x, y, rx, modeY, modeTileW, modeTileH)) {
-      screen7FilterMode = (Screen2FilterMode)i;
+      toggleModeFilterSelection(screen7FilterModeMask, i);
       drawPotaFilterMenu();
       return;
     }
@@ -4310,7 +4448,7 @@ void handleScreen7MenuTouch(uint16_t x, uint16_t y) {
       int rx = bandStartX + col * (bandTileW + bandGap);
       int ry = bandStartY + row * (bandTileH + bandGap);
       if (isPointInRect(x, y, rx, ry, bandTileW, bandTileH)) {
-        screen7FilterBandIndex = bandIdx;
+        toggleBandFilterSelection(screen7FilterBandMask, bandIdx);
         drawPotaFilterMenu();
         return;
       }
@@ -4346,10 +4484,10 @@ void drawHamalertFilterMenu() {
   const int modeGap = 6;
   const int modeStartX = (320 - (4 * modeTileW + 3 * modeGap)) / 2;
   const int modeY = 40;
-  drawFilterTile(modeStartX + 0 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "ALL", screen8FilterMode == FILTER_MODE_ALL);
-  drawFilterTile(modeStartX + 1 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "CW", screen8FilterMode == FILTER_MODE_CW);
-  drawFilterTile(modeStartX + 2 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "SSB", screen8FilterMode == FILTER_MODE_SSB);
-  drawFilterTile(modeStartX + 3 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "DIGI", screen8FilterMode == FILTER_MODE_DIGI);
+  drawFilterTile(modeStartX + 0 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "ALL", isModeFilterTileSelected(screen8FilterModeMask, FILTER_MODE_ALL));
+  drawFilterTile(modeStartX + 1 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "CW", isModeFilterTileSelected(screen8FilterModeMask, FILTER_MODE_CW));
+  drawFilterTile(modeStartX + 2 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "SSB", isModeFilterTileSelected(screen8FilterModeMask, FILTER_MODE_SSB));
+  drawFilterTile(modeStartX + 3 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "DIGI", isModeFilterTileSelected(screen8FilterModeMask, FILTER_MODE_DIGI));
 
   tft.setTextColor(TFT_LIGHTGREY);
   tft.setCursor(10, 82);
@@ -4366,7 +4504,7 @@ void drawHamalertFilterMenu() {
       if (bandIdx >= SCREEN8_FILTER_BANDS_COUNT) break;
       int x = bandStartX + col * (bandTileW + bandGap);
       int y = bandStartY + row * (bandTileH + bandGap);
-      drawFilterTile(x, y, bandTileW, bandTileH, SCREEN8_FILTER_BANDS[bandIdx], screen8FilterBandIndex == bandIdx);
+      drawFilterTile(x, y, bandTileW, bandTileH, SCREEN8_FILTER_BANDS[bandIdx], isBandFilterTileSelected(screen8FilterBandMask, bandIdx));
       bandIdx++;
     }
   }
@@ -4388,7 +4526,7 @@ void handleScreen8MenuTouch(uint16_t x, uint16_t y) {
   for (int i = 0; i < 4; i++) {
     int rx = modeStartX + i * (modeTileW + modeGap);
     if (isPointInRect(x, y, rx, modeY, modeTileW, modeTileH)) {
-      screen8FilterMode = (Screen2FilterMode)i;
+      toggleModeFilterSelection(screen8FilterModeMask, i);
       drawHamalertFilterMenu();
       return;
     }
@@ -4406,7 +4544,7 @@ void handleScreen8MenuTouch(uint16_t x, uint16_t y) {
       int rx = bandStartX + col * (bandTileW + bandGap);
       int ry = bandStartY + row * (bandTileH + bandGap);
       if (isPointInRect(x, y, rx, ry, bandTileW, bandTileH)) {
-        screen8FilterBandIndex = bandIdx;
+        toggleBandFilterSelection(screen8FilterBandMask, bandIdx);
         drawHamalertFilterMenu();
         return;
       }
@@ -5142,11 +5280,13 @@ void updateScreen6Data() {
         String symbolShort = getAPRSSymbolShort(station);
         uint16_t symbolColor = TFT_GREEN;
         if (symbolShort == "HUMAN") {
-          symbolColor = TFT_BLUE;
+          symbolColor = 0x3C1F;
         } else if (symbolShort == "HOUSE") {
           symbolColor = TFT_YELLOW;
         } else if (symbolShort == "CAR") {
           symbolColor = TFT_RED;
+        } else if (symbolShort == "HAMCLOCK") {
+          symbolColor = TFT_ORANGE;
         }
         tableSprite->setTextColor(symbolColor);
         tableSprite->setCursor(125, yPos);
@@ -5268,11 +5408,13 @@ void updateScreen6Data() {
       String symbolShort = getAPRSSymbolShort(station);
       uint16_t symbolColor = TFT_GREEN;
       if (symbolShort == "HUMAN") {
-        symbolColor = TFT_BLUE;
+        symbolColor = 0x3C1F;
       } else if (symbolShort == "HOUSE") {
         symbolColor = TFT_YELLOW;
       } else if (symbolShort == "CAR") {
         symbolColor = TFT_RED;
+      } else if (symbolShort == "HAMCLOCK") {
+        symbolColor = TFT_ORANGE;
       }
       tft.setTextColor(symbolColor);
       tft.setCursor(125, yPos);
@@ -5407,11 +5549,13 @@ void drawAprsIs() {
       String symbolShort = getAPRSSymbolShort(station);
       uint16_t symbolColor = TFT_GREEN;
       if (symbolShort == "HUMAN") {
-        symbolColor = TFT_BLUE;
+        symbolColor = 0x3C1F;
       } else if (symbolShort == "HOUSE") {
         symbolColor = TFT_YELLOW;
       } else if (symbolShort == "CAR") {
         symbolColor = TFT_RED;
+      } else if (symbolShort == "HAMCLOCK") {
+        symbolColor = TFT_ORANGE;
       }
       tft.setTextColor(symbolColor);
       tft.setCursor(125, yPos);
@@ -5518,11 +5662,13 @@ static bool parsePropagationXml(const String &xml, PropagationData &out) {
   String sfi = extractXmlTagValue(xml, "solarflux");
   String kindex = extractXmlTagValue(xml, "kindex");
   String aindex = extractXmlTagValue(xml, "aindex");
+  String muf = extractXmlTagValue(xml, "muf");
   String updated = extractXmlTagValue(xml, "updated");
 
   sfi.trim();
   kindex.trim();
   aindex.trim();
+  muf.trim();
   updated.trim();
 
   if (sfi.length() == 0 || kindex.length() == 0) {
@@ -5532,6 +5678,7 @@ static bool parsePropagationXml(const String &xml, PropagationData &out) {
   out.sfi = sfi;
   out.kindex = kindex;
   out.aindex = aindex.length() ? aindex : "--";
+  out.muf = muf.length() ? muf : "--";
   out.updated = updated.length() ? updated : "--";
   out.valid = true;
   out.lastError = "";
@@ -5617,6 +5764,7 @@ uint32_t computeScreen3Signature() {
     &propagationData.sfi,
     &propagationData.kindex,
     &propagationData.aindex,
+    &propagationData.muf,
     &propagationData.updated,
     &propagationData.lastError
   };
@@ -5641,12 +5789,13 @@ static uint16_t conditionColor(String cond) {
 
 void drawSunSpotsBody() {
   const int bodyTop = 32;
-  const int bodyBottom = 220;
+  const int bodyBottom = 240;
   tft.fillRect(0, bodyTop, 320, bodyBottom - bodyTop, TFT_BLACK);
 
   String sfiText = propagationData.valid && propagationData.sfi.length() ? propagationData.sfi : "--";
   String kText = propagationData.valid && propagationData.kindex.length() ? propagationData.kindex : "--";
   String aText = propagationData.valid && propagationData.aindex.length() ? propagationData.aindex : "--";
+  String mufText = propagationData.valid && propagationData.muf.length() ? propagationData.muf : "--";
   String updatedText = propagationData.valid && propagationData.updated.length() ? propagationData.updated : "--";
 
   tft.setTextSize(2);
@@ -5662,7 +5811,7 @@ void drawSunSpotsBody() {
 
   tft.setTextSize(2);
   tft.setTextColor(TFT_DARKGREY);
-  tft.setCursor(10, 100);
+  tft.setCursor(10, 97);
   tft.print("K-INDEX");
 
   float kVal = kText.length() ? kText.toFloat() : -1.0f;
@@ -5673,33 +5822,44 @@ void drawSunSpotsBody() {
   tft.setTextSize(4);
   tft.setTextColor(kColor);
   int kWidth = kText.length() * 24;
-  tft.setCursor(310 - kWidth, 92);
+  tft.setCursor(310 - kWidth, 89);
   tft.print(kText);
 
   tft.setTextSize(2);
   tft.setTextColor(TFT_DARKGREY);
-  tft.setCursor(10, 148);
+  tft.setCursor(10, 142);
   tft.print("A-INDEX");
 
   tft.setTextSize(4);
   tft.setTextColor(TFT_CYAN);
   int aWidth = aText.length() * 24;
-  tft.setCursor(310 - aWidth, 140);
+  tft.setCursor(310 - aWidth, 134);
   tft.print(aText);
+
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_DARKGREY);
+  tft.setCursor(10, 182);
+  tft.print("MUF");
+
+  tft.setTextSize(3);
+  tft.setTextColor(TFT_YELLOW);
+  int mufWidth = mufText.length() * 18;
+  tft.setCursor(310 - mufWidth, 174);
+  tft.print(mufText);
 
   tft.setTextSize(1);
   tft.setTextColor(TFT_DARKGREY);
-  tft.setCursor(10, 190);
+  tft.setCursor(10, 210);
   tft.print("UPDATED UTC");
   tft.setTextSize(2);
   tft.setTextColor(TFT_LIGHTGREY);
-  tft.setCursor(10, 202);
+  tft.setCursor(10, 222);
   tft.print(updatedText);
 
   if (!propagationData.valid) {
     tft.setTextSize(1);
     tft.setTextColor(TFT_RED);
-    tft.setCursor(10, 176);
+    tft.setCursor(10, 196);
     String err = propagationData.lastError.length() ? propagationData.lastError : tr(TR_NO_DATA);
     tft.print(tr(TR_ERROR_PREFIX));
     tft.print(err);
@@ -5745,13 +5905,6 @@ void drawSunSpots() {
   }
 
   drawSunSpotsBody();
-
-  tft.fillTriangle(10, 230, 20, 222, 20, 238, TFT_RADIO_ORANGE);
-  tft.fillTriangle(310, 230, 300, 222, 300, 238, TFT_RADIO_ORANGE);
-  tft.setTextColor(0x52AA);
-  tft.setTextSize(1);
-  tft.setCursor(125, 226);
-  tft.print("SWITCH SCREEN");
 }
 
 void updateScreen4Clock() {
@@ -6123,7 +6276,7 @@ bool fetchWeatherForecast(double lat, double lon) {
     72L * 3600L
   };
   const int fallbackIdx[WeatherData::DETAIL_COLS] = {0, 1, 8, 16, 24};
-  const long timezoneOffsetSec = (long)timezoneHours * 3600L;
+  const long timezoneOffsetSec = (long)(timezoneHours * 3600.0f);
   const long nowLocalUnix = nowUnix + timezoneOffsetSec;
   const long baseLocalDayStart = (nowLocalUnix / 86400L) * 86400L;
 
@@ -6913,8 +7066,6 @@ void drawWeather() {
   tft.fillRect(0, 0, 320, 32, TFT_RADIO_ORANGE);
   tft.setTextColor(TFT_BLACK);
 
-  drawHamburgerMenuButton3D(5, 7);
-
   tft.setTextSize(2);
   tft.setCursor(35, 8);
   tft.print(tr(TR_WEATHER));
@@ -6937,8 +7088,6 @@ void drawWeatherForecast() {
 
   tft.fillRect(0, 0, 320, 32, TFT_RADIO_ORANGE);
   tft.setTextColor(TFT_BLACK);
-
-  drawHamburgerMenuButton3D(5, 7);
 
   const char *detailHeader = (tftLanguage == TFT_LANG_EN) ? "Weather forecast" : "Prognoza pogody";
   tft.setTextSize(2);
@@ -7150,7 +7299,6 @@ void drawMatrixClock() {
   if (!matrixInitialized) {
     setupMatrix();
   }
-  prepareMatrixIntro();
   drawMatrixStatic();
   screen10NeedsRedraw = false;
   lastScreen10UpdateMs = millis();
@@ -7926,7 +8074,7 @@ static bool drawBmpFromFS(const String &filename, int16_t x, int16_t y) {
   }
 
   uint32_t seekOffset;
-  uint16_t w, h;
+  int32_t w, h;
   if (readBmp16(bmpFS) != 0x4D42) {
     bmpFS.close();
     return false;
@@ -7939,30 +8087,55 @@ static bool drawBmpFromFS(const String &filename, int16_t x, int16_t y) {
   w = readBmp32(bmpFS);
   h = readBmp32(bmpFS);
 
-  if (readBmp16(bmpFS) != 1 || readBmp16(bmpFS) != 24 || readBmp32(bmpFS) != 0) {
+  uint16_t planes = readBmp16(bmpFS);
+  uint16_t bpp = readBmp16(bmpFS);
+  uint32_t compression = readBmp32(bmpFS);
+
+  // Support classic 24-bit BMP (weather icons) and 32-bit BMP (e.g. startup logo).
+  bool bmp24 = (bpp == 24 && compression == 0);
+  bool bmp32 = (bpp == 32 && (compression == 0 || compression == 3));
+  if (planes != 1 || (!bmp24 && !bmp32) || w <= 0 || h == 0) {
     bmpFS.close();
     return false;
   }
 
-  y += h - 1;
+  bool bottomUp = (h > 0);
+  int32_t absH = bottomUp ? h : -h;
+  if (bottomUp) {
+    y += (int16_t)(absH - 1);
+  }
+
   bool oldSwap = tft.getSwapBytes();
   tft.setSwapBytes(true);
   bmpFS.seek(seekOffset);
 
-  uint16_t padding = (4 - ((w * 3) & 3)) & 3;
-  uint8_t lineBuffer[w * 3 + padding];
+  const uint8_t bytesPerPixel = bmp32 ? 4 : 3;
+  uint16_t padding = (4 - (((uint32_t)w * bytesPerPixel) & 3)) & 3;
+  uint32_t rowSize = (uint32_t)w * bytesPerPixel + padding;
+  uint8_t lineBuffer[rowSize];
 
-  for (uint16_t row = 0; row < h; row++) {
-    bmpFS.read(lineBuffer, sizeof(lineBuffer));
+  for (int32_t row = 0; row < absH; row++) {
+    if (bmpFS.read(lineBuffer, rowSize) != (int)rowSize) {
+      tft.setSwapBytes(oldSwap);
+      bmpFS.close();
+      return false;
+    }
     uint8_t *bptr = lineBuffer;
     uint16_t *tptr = (uint16_t *)lineBuffer;
-    for (uint16_t col = 0; col < w; col++) {
+    for (int32_t col = 0; col < w; col++) {
       uint8_t b = *bptr++;
       uint8_t g = *bptr++;
       uint8_t r = *bptr++;
+      if (bmp32) {
+        bptr++; // Skip alpha/extra byte.
+      }
       *tptr++ = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
     }
-    tft.pushImage(x, y--, w, 1, (uint16_t *)lineBuffer);
+    if (bottomUp) {
+      tft.pushImage(x, y--, (uint16_t)w, 1, (uint16_t *)lineBuffer);
+    } else {
+      tft.pushImage(x, y + (int16_t)row, (uint16_t)w, 1, (uint16_t *)lineBuffer);
+    }
   }
 
   tft.setSwapBytes(oldSwap);
@@ -8004,6 +8177,7 @@ String getAPRSSymbolShort(const APRSStation &station) {
   if (raw == "/k") return "TRUCK";
   if (raw == "/u") return "TRUCK";
   if (raw == "/v") return "VAN";
+  if (raw == "/V") return "HAMCLOCK";
   if (raw == "/p") return "ROVER";
   if (raw == "/o") return "EOC";
   if (raw == "/t") return "TRKSTOP";
@@ -9722,6 +9896,7 @@ bool fetchPotaApi() {
       return false;
     }
 
+    lockPotaSpots();
     potaSpotCount = 0;
     for (JsonObject spot : arr) {
       if (potaSpotCount >= MAX_POTA_SPOTS) break;
@@ -9760,7 +9935,9 @@ bool fetchPotaApi() {
         enqueueQrzLookup(s.callsign);
       }
     }
-    return potaSpotCount > 0;
+    bool hasPotaSpots = potaSpotCount > 0;
+    unlockPotaSpots();
+    return hasPotaSpots;
   };
 
   HTTPClient http;
@@ -9834,6 +10011,7 @@ bool fetchPotaApi() {
   }
 
   // Posortuj malejąco po czasie (ISO string porównuje się leksykograficznie poprawnie)
+  lockPotaSpots();
   for (int i = 0; i < potaSpotCount - 1; i++) {
     for (int j = i + 1; j < potaSpotCount; j++) {
       if (potaSpots[j].time > potaSpots[i].time) {
@@ -9843,8 +10021,10 @@ bool fetchPotaApi() {
       }
     }
   }
+  bool hasPotaSpots = potaSpotCount > 0;
+  unlockPotaSpots();
 
-  return potaSpotCount > 0;
+  return hasPotaSpots;
 }
 
 void removeQrzQueueAt(int idx) {
@@ -9918,6 +10098,7 @@ void updateSpotsWithQrz(const String &callsign, const String &grid,
   }
   unlockDxSpots();
 
+  lockPotaSpots();
   for (int i = 0; i < potaSpotCount; i++) {
     if (!potaSpots[i].callsign.equalsIgnoreCase(callsign)) {
       continue;
@@ -9964,6 +10145,7 @@ void updateSpotsWithQrz(const String &callsign, const String &grid,
       updatedPota = true;
     }
   }
+  unlockPotaSpots();
 
   if (updated) {
 #ifdef ENABLE_TFT_DISPLAY
@@ -10266,6 +10448,7 @@ void addSpot(DXSpot spot) {
 
 void addPotaSpot(DXSpot spot) {
   compactDxSpotStrings(spot);
+  lockPotaSpots();
   if (potaSpotCount < MAX_POTA_SPOTS) {
     potaSpotCount++;
   }
@@ -10275,10 +10458,12 @@ void addPotaSpot(DXSpot spot) {
   }
 
   potaSpots[0] = spot;
+  unlockPotaSpots();
 }
 
 void addHamalertSpot(DXSpot spot) {
   compactDxSpotStrings(spot);
+  lockHamalertSpots();
   if (hamalertSpotCount < MAX_POTA_SPOTS) {
     hamalertSpotCount++;
   }
@@ -10288,6 +10473,7 @@ void addHamalertSpot(DXSpot spot) {
   }
 
   hamalertSpots[0] = spot;
+  unlockHamalertSpots();
 }
 
 bool parseHamalertJsonSpot(const String &line, DXSpot &spot) {
@@ -10412,7 +10598,9 @@ bool fetchHamalertTelnet() {
   }
   Serial.println("[HAMALERT] connected");
 
+  lockHamalertSpots();
   hamalertSpotCount = 0;
+  unlockHamalertSpots();
   String line;
   line.reserve(HAMALERT_MAX_LINE_LEN + 16);
 
@@ -11478,10 +11666,16 @@ void handleAPRSData() {
         if (parseAPRSFrame(line, station)) {
           addAPRSStation(station);
 
-          if (aprsAlertEnabled && shouldTriggerAprsAlert(station)) {
+          // While Unlis Hunter or TFT settings screen is active,
+          // suppress APRS alert popups and LED/buzzer alerts.
+          if (aprsAlertEnabled && currentScreen != SCREEN_UNLIS_HUNTER && !brightnessMenuActive && shouldTriggerAprsAlert(station)) {
             Serial.print("[APRS ALERT] stacja wykryta opisana w formacie tnc: ");
             Serial.println(line);
-            triggerAprsRgbLedAlert();
+            // WX stations: show TFT popup but skip LED/buzzer alert
+            bool isWxStation = aprsAlertWxEnabled && isAprsWxPayloadValidForAlert(station);
+            if (!isWxStation) {
+              triggerAprsRgbLedAlert();
+            }
             #ifdef ENABLE_TFT_DISPLAY
             portENTER_CRITICAL(&aprsAlertPendingMux);
             aprsAlertPendingStation = station;
@@ -11509,6 +11703,8 @@ void startAPMode() {
   // ĹĽeby nie gubiÄ‡ poĹ‚Ä…czenia na telefonie/PC przy zmianie kanaĹ‚u przez STA.
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
+  // Odmierzaj ponowną próbę STA od momentu wejścia do AP.
+  lastWiFiReconnectAttempt = millis();
   Serial.println("AP Mode uruchomiony");
   Serial.print("SSID: ");
   Serial.println(AP_SSID);
@@ -11527,6 +11723,10 @@ void requestRestart(unsigned long delayMs = 1500) {
 }
 
 bool connectToWiFi() {
+  return connectToWiFiWithAttempts(40, true);
+}
+
+bool connectToWiFiWithAttempts(uint8_t maxAttemptsPerSsid, bool runDiagnostics) {
   if (wifiSSID.length() == 0 && wifiSSID2.length() == 0) {
     return false;
   }
@@ -11538,7 +11738,7 @@ bool connectToWiFi() {
 
   WiFiCred candidates[2] = {{wifiSSID, wifiPassword}, {wifiSSID2, wifiPassword2}};
 
-  auto attemptConnect = [](const WiFiCred &cred) -> bool {
+  auto attemptConnect = [maxAttemptsPerSsid, runDiagnostics](const WiFiCred &cred) -> bool {
     Serial.println("=== WiFi connect ===");
     Serial.print("SSID: '");
     Serial.print(cred.ssid);
@@ -11560,7 +11760,7 @@ bool connectToWiFi() {
     WiFi.begin(cred.ssid.c_str(), cred.pass.c_str());
 
     int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    while (WiFi.status() != WL_CONNECTED && attempts < maxAttemptsPerSsid) {
       delay(500);
       yield();
       Serial.print(".");
@@ -11577,29 +11777,31 @@ bool connectToWiFi() {
     Serial.print("WiFi.status(): ");
     Serial.println((int)WiFi.status());
 
-    Serial.println("--- WiFi diag ---");
-    WiFi.printDiag(Serial);
-    Serial.println("--- Scan networks ---");
-    int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
-    Serial.print("Znaleziono sieci: ");
-    Serial.println(n);
-    bool found = false;
-    for (int i = 0; i < n; i++) {
-      String s = WiFi.SSID(i);
-      int32_t rssi = WiFi.RSSI(i);
-      wifi_auth_mode_t enc = WiFi.encryptionType(i);
-      if (s == cred.ssid) {
-        found = true;
-        Serial.print("MATCH SSID: ");
-        Serial.print(s);
-        Serial.print(" RSSI=");
-        Serial.print(rssi);
-        Serial.print(" enc=");
-        Serial.println((int)enc);
+    if (runDiagnostics) {
+      Serial.println("--- WiFi diag ---");
+      WiFi.printDiag(Serial);
+      Serial.println("--- Scan networks ---");
+      int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
+      Serial.print("Znaleziono sieci: ");
+      Serial.println(n);
+      bool found = false;
+      for (int i = 0; i < n; i++) {
+        String s = WiFi.SSID(i);
+        int32_t rssi = WiFi.RSSI(i);
+        wifi_auth_mode_t enc = WiFi.encryptionType(i);
+        if (s == cred.ssid) {
+          found = true;
+          Serial.print("MATCH SSID: ");
+          Serial.print(s);
+          Serial.print(" RSSI=");
+          Serial.print(rssi);
+          Serial.print(" enc=");
+          Serial.println((int)enc);
+        }
       }
-    }
-    if (!found) {
-      Serial.println("UWAGA: Nie widzÄ™ Twojego SSID w skanie (moĹĽe 5GHz / inny SSID / poza zasiÄ™giem / ukryte SSID).");
+      if (!found) {
+        Serial.println("UWAGA: Nie widzÄ™ Twojego SSID w skanie (moĹĽe 5GHz / inny SSID / poza zasiÄ™giem / ukryte SSID).");
+      }
     }
 
     return false;
@@ -11636,6 +11838,75 @@ bool connectToWiFi() {
 
   wifiConnected = false;
   return false;
+}
+
+void retryWiFiFromAPIfDue(unsigned long now) {
+  if (wifiConnected) {
+    return;
+  }
+
+  if (wifiSSID.length() == 0 && wifiSSID2.length() == 0) {
+    return;
+  }
+
+  // Retry uruchamiaj tylko wtedy, gdy urządzenie realnie działa jako AP.
+  if ((WiFi.getMode() & WIFI_AP) == 0) {
+    return;
+  }
+
+  if (lastWiFiReconnectAttempt != 0 && (now - lastWiFiReconnectAttempt) < WIFI_AP_RETRY_INTERVAL_MS) {
+    return;
+  }
+
+  lastWiFiReconnectAttempt = now;
+  Serial.println("[WIFI] AP retry timer elapsed -> trying STA (SSID1/SSID2)");
+
+  if (connectToWiFi()) {
+    Serial.println("[WIFI] STA reconnect successful");
+    return;
+  }
+
+  Serial.println("[WIFI] STA reconnect failed, returning to AP mode");
+  startAPMode();
+}
+
+void retryWiFiFromSTAIfDue(unsigned long now) {
+  if (wifiConnected) {
+    wifiStaRetryWindowStartMs = 0;
+    return;
+  }
+
+  if (wifiSSID.length() == 0 && wifiSSID2.length() == 0) {
+    return;
+  }
+
+  // W AP retry obsługuje osobna funkcja.
+  if (WiFi.getMode() & WIFI_AP) {
+    return;
+  }
+
+  if (wifiStaRetryWindowStartMs == 0) {
+    wifiStaRetryWindowStartMs = now;
+  }
+
+  if ((now - wifiStaRetryWindowStartMs) >= WIFI_STA_RETRY_WINDOW_MS) {
+    Serial.println("[WIFI] STA retry window (10 min) elapsed -> switching to AP mode");
+    wifiStaRetryWindowStartMs = 0;
+    startAPMode();
+    return;
+  }
+
+  if (lastWiFiStaReconnectAttempt != 0 && (now - lastWiFiStaReconnectAttempt) < WIFI_STA_RETRY_INTERVAL_MS) {
+    return;
+  }
+
+  lastWiFiStaReconnectAttempt = now;
+  Serial.println("[WIFI] STA offline -> retry connect (SSID1/SSID2)");
+  if (connectToWiFiWithAttempts(WIFI_STA_RECONNECT_ATTEMPTS, false)) {
+    Serial.println("[WIFI] STA reconnect successful");
+    wifiStaRetryWindowStartMs = 0;
+    updateNTPTime();
+  }
 }
 
 // ========== TELNET CLUSTER ==========
@@ -12055,9 +12326,9 @@ void loadPreferences() {
   yield();
   userLocator = preferences->getString("user_locator", "");
   yield();
-  timezoneHours = preferences->getInt("timezone", DEFAULT_TIMEZONE_HOURS);
-  if (timezoneHours < -12) timezoneHours = -12;
-  if (timezoneHours > 14) timezoneHours = 14;
+  timezoneHours = preferences->getFloat("timezone", DEFAULT_TIMEZONE_HOURS);
+  if (timezoneHours < -12.0f) timezoneHours = -12.0f;
+  if (timezoneHours > 14.0f) timezoneHours = 14.0f;
   yield();
   userLat = preferences->getFloat("user_lat", 0.0f);
   yield();
@@ -12115,9 +12386,9 @@ void loadPreferences() {
   yield();
   clusterNoWCY = preferences->getBool("cluster_nowcy", true);
   yield();
-  clusterUseFilters = preferences->getBool("cluster_usefilters", false);
+  clusterUseFilters = preferences->getBool(NVS_KEY_CLUSTER_USEFILTERS, true);
   yield();
-  clusterFilterCommands = preferences->getString("cluster_filters", "");
+  clusterFilterCommands = preferences->getString("cluster_filters", "set/ft8");
   yield();
   
   // Konfiguracja APRS-IS
@@ -12196,7 +12467,7 @@ void savePreferences() {
   preferences->putString("hama_pass", hamalertPassword);
   preferences->putString("user_callsign", userCallsign);
   preferences->putString("user_locator", userLocator);
-  preferences->putInt("timezone", timezoneHours);
+  preferences->putFloat("timezone", timezoneHours);
   preferences->putFloat("user_lat", (float)userLat);
   preferences->putFloat("user_lon", (float)userLon);
   preferences->putBool("user_ll_ok", userLatLonValid);
@@ -12253,7 +12524,7 @@ void savePreferences() {
   preferences->putBool("cluster_noann", clusterNoAnnouncements);
   preferences->putBool("cluster_nowwv", clusterNoWWV);
   preferences->putBool("cluster_nowcy", clusterNoWCY);
-  preferences->putBool("cluster_usefilters", clusterUseFilters);
+  preferences->putBool(NVS_KEY_CLUSTER_USEFILTERS, clusterUseFilters);
   preferences->putString("cluster_filters", clusterFilterCommands);
   
   preferences->end();
@@ -12328,6 +12599,47 @@ void setupWebServer() {
       f.close();
     } else {
       server->send(404, "text/plain", "manual.txt missing in LittleFS");
+    }
+  });
+
+  // Arkusze stylów CSS (wspólne + desktop/mobile)
+  server->on("/style.css", HTTP_GET, []() {
+    if (littleFsReady && LittleFS.exists("/style.css")) {
+      File f = LittleFS.open("/style.css", "r");
+      server->streamFile(f, "text/css; charset=utf-8");
+      f.close();
+    } else {
+      server->send(404, "text/plain", "style.css missing in LittleFS");
+    }
+  });
+
+  server->on("/style.base.css", HTTP_GET, []() {
+    if (littleFsReady && LittleFS.exists("/style.base.css")) {
+      File f = LittleFS.open("/style.base.css", "r");
+      server->streamFile(f, "text/css; charset=utf-8");
+      f.close();
+    } else {
+      server->send(404, "text/plain", "style.base.css missing in LittleFS");
+    }
+  });
+
+  server->on("/style.desktop.css", HTTP_GET, []() {
+    if (littleFsReady && LittleFS.exists("/style.desktop.css")) {
+      File f = LittleFS.open("/style.desktop.css", "r");
+      server->streamFile(f, "text/css; charset=utf-8");
+      f.close();
+    } else {
+      server->send(404, "text/plain", "style.desktop.css missing in LittleFS");
+    }
+  });
+
+  server->on("/style.mobile.css", HTTP_GET, []() {
+    if (littleFsReady && LittleFS.exists("/style.mobile.css")) {
+      File f = LittleFS.open("/style.mobile.css", "r");
+      server->streamFile(f, "text/css; charset=utf-8");
+      f.close();
+    } else {
+      server->send(404, "text/plain", "style.mobile.css missing in LittleFS");
     }
   });
   
@@ -12441,6 +12753,31 @@ void setupWebServer() {
     serializeJson(doc, json);
     server->send(200, "application/json", json);
   });
+
+  // API - Propagation + HF Band Info
+  server->on("/api/propagation", HTTP_GET, []() {
+    StaticJsonDocument<2048> doc;
+    doc["valid"] = propagationData.valid;
+    doc["sfi"] = propagationData.sfi;
+    doc["kindex"] = propagationData.kindex;
+    doc["aindex"] = propagationData.aindex;
+    doc["muf"] = propagationData.muf;
+    doc["updated"] = propagationData.updated;
+    doc["lastError"] = propagationData.lastError;
+
+    JsonArray bands = doc.createNestedArray("hfBands");
+    for (int i = 0; i < 4; i++) {
+      JsonObject band = bands.createNestedObject();
+      band["label"] = propagationData.hfBandLabel[i];
+      band["freq"] = propagationData.hfBandFreq[i];
+      band["day"] = propagationData.hfBandDay[i];
+      band["night"] = propagationData.hfBandNight[i];
+    }
+
+    String json;
+    serializeJson(doc, json);
+    server->send(200, "application/json", json);
+  });
   
   // API - zapisz konfiguracjÄ™
   server->on("/api/save", HTTP_POST, []() {
@@ -12486,10 +12823,10 @@ void setupWebServer() {
       }
       userCallsign = doc["user_callsign"].as<String>();
       userLocator = doc["user_locator"].as<String>();
-      if (doc["timezone"].is<int>()) {
-        timezoneHours = doc["timezone"].as<int>();
-        if (timezoneHours < -12) timezoneHours = -12;
-        if (timezoneHours > 14) timezoneHours = 14;
+      if (doc["timezone"].is<float>() || doc["timezone"].is<double>() || doc["timezone"].is<int>()) {
+        timezoneHours = doc["timezone"].as<float>();
+        if (timezoneHours < -12.0f) timezoneHours = -12.0f;
+        if (timezoneHours > 14.0f) timezoneHours = 14.0f;
       }
       
       // WspĂłĹ‚rzÄ™dne geograficzne (LAT/LON)
@@ -12796,11 +13133,18 @@ void setupWebServer() {
       if (potaApiUrl.length() == 0) {
         potaApiUrl = DEFAULT_POTA_API_URL;
       }
-      if (hamalertHost.length() == 0) {
-        hamalertHost = DEFAULT_HAMALERT_HOST;
-      }
-      if (hamalertPort <= 0 || hamalertPort > 65535) {
-        hamalertPort = DEFAULT_HAMALERT_PORT;
+      bool hamalertCredentialsProvided = (hamalertLogin.length() > 0 && hamalertPassword.length() > 0);
+      if (hamalertCredentialsProvided) {
+        if (hamalertHost.length() == 0) {
+          hamalertHost = DEFAULT_HAMALERT_HOST;
+        }
+        if (hamalertPort <= 0 || hamalertPort > 65535) {
+          hamalertPort = DEFAULT_HAMALERT_PORT;
+        }
+      } else {
+        // Empty login/password means HAMALERT is intentionally disabled.
+        hamalertHost = "";
+        hamalertPort = 0;
       }
 
       // Kolejność ekranów konfigurowana z WWW
@@ -13081,7 +13425,7 @@ void uiTaskLoop(void *parameter) {
         drawScreen(currentScreen);
       }
 
-      if (aprsAlertDrawPending) {
+      if (aprsAlertDrawPending && !brightnessMenuActive) {
         APRSStation pendingStation;
         portENTER_CRITICAL(&aprsAlertPendingMux);
         pendingStation = aprsAlertPendingStation;
@@ -13093,8 +13437,11 @@ void uiTaskLoop(void *parameter) {
       handleTouchNavigation();
     }
 
-    if (tftAutoSwitchEnabled && tftInitialized && !inMenu && !aprsAlertScreenActive && !touchCalActive && !brightnessMenuActive) {
+    if (tftAutoSwitchEnabled && tftInitialized && !inMenu && !aprsAlertScreenActive && !touchCalActive && !brightnessMenuActive && currentScreen != SCREEN_UNLIS_HUNTER) {
       unsigned long nowSwitch = millis();
+      if (autoswitchPausedUntilMs > 0 && nowSwitch < autoswitchPausedUntilMs) {
+        // autoswitch zapauzowany po dotknięciu środka ekranu
+      } else {
       if (tftAutoSwitchLastMs == 0 || tftAutoSwitchLastScreen != currentScreen) {
         tftAutoSwitchLastMs = nowSwitch;
         tftAutoSwitchLastScreen = currentScreen;
@@ -13110,6 +13457,7 @@ void uiTaskLoop(void *parameter) {
           tftAutoSwitchLastScreen = currentScreen;
         }
       }
+      } // koniec else (autoswitch nie zapauzowany)
     }
 
     if (!restartRequested) {
@@ -13209,6 +13557,12 @@ void setup() {
   if (dxSpotsMutex == nullptr) {
     dxSpotsMutex = xSemaphoreCreateMutex();
   }
+  if (potaSpotsMutex == nullptr) {
+    potaSpotsMutex = xSemaphoreCreateMutex();
+  }
+  if (hamalertSpotsMutex == nullptr) {
+    hamalertSpotsMutex = xSemaphoreCreateMutex();
+  }
 
   initStatusRgbLed();
   updateStatusRgbLed();
@@ -13303,7 +13657,7 @@ void setup() {
   // Aktualizuj wyĹ›wietlacz TFT (ekran startowy)
 #ifdef ENABLE_TFT_DISPLAY
   drawWelcomeScreenYellow();
-  delay(2000);
+  delay(4000);
   drawWelcomeScreenGreen();
   delay(3000);
   bootSequenceActive = false;
@@ -13380,6 +13734,12 @@ void loop() {
   }
 
   updateStatusRgbLed();
+
+  // W trybie STA okresowo ponawiaj aktywną próbę połączenia.
+  retryWiFiFromSTAIfDue(now);
+
+  // W trybie AP okresowo podejmuj bezpieczną próbę powrotu do STA.
+  retryWiFiFromAPIfDue(now);
 
   // Jeśli jesteśmy offline, zostajemy w AP (portal) — stabilnie.
   

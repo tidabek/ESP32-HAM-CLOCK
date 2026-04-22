@@ -81,6 +81,13 @@ Key libs (see `platformio.ini`): ArduinoJson 7, TFT_eSPI, XPT2046_Touchscreen.
 - POTA (filters, time-ordered)
 - Matrix Clock
 
+## Change Logs
+
+- Polish, 1.22 vs 1.2: `ZMIANY_1.22_vs_1.2.txt`
+- Polish, 1.22 vs 1.21: `ZMIANY_1.22_vs_1.21.txt`
+- English, 1.22 vs 1.2: `CHANGES_1.22_vs_1.2.txt`
+- English, 1.22 vs 1.21: `CHANGES_1.22_vs_1.21.txt`
+
 ## Network Cadence
 
 - WiFi: auto-reconnect to last SSID (STA); AP only when no config or at cold start without WiFi

@@ -1,0 +1,77 @@
+ESP32-HAM-CLOCK
+Changes in version 1.22 compared to 1.2
+
+This comparison was prepared using the older GitHub 1.2 release (tag v1.2.0)
+and the current 1.22 code state in the repository.
+
+1) Project structure and source release
+- The project is prepared as a full PlatformIO source tree.
+- The firmware source is located in src/ESP32-HAM-CLOCK.ino.
+- Project/config files were added, including platformio.ini and User_Setup.h.
+- Separate web files, manuals and README files were added in both PL and EN versions.
+
+2) WiFi, AP and connectivity
+- Support for two WiFi SSID/password sets was added (primary and backup).
+- AP fallback logic was expanded for cases where WiFi connection is not available.
+- Periodic retries from AP mode back to WiFi STA were added without stopping the AP portal.
+- In the current code, AP mode checks every 5 minutes whether WiFi is available again.
+- Additional STA retry/reconnect stabilization logic was added.
+
+3) DX Cluster, POTA and HAMALERT
+- DX Cluster support was added and expanded on both TFT and web panel.
+- POTA support via API was added, together with a dedicated screen / table.
+- HAMALERT telnet support was added, together with a dedicated screen / table.
+- Persistent saving of the DX Cluster "use filters" option in NVS was fixed.
+- The default DX filter command is now: set/ft8.
+- WebSDR/KiwiSDR links are now built correctly for current spots, including CW handling.
+
+4) TFT and web panel filters
+- DX, POTA and HAMALERT filters on TFT were reworked from single-select to multi-select.
+- PL and EN web panels now also support selecting multiple bands and multiple modes at the same time.
+- The same tile / button layout was preserved; only the selection logic was changed.
+- In the current version, those filter selections are not stored persistently in Preferences.
+
+5) APRS-IS, radar, beacon and alerts
+- APRS-IS list screen and APRS radar screen were added.
+- APRS sorting was added: TIME / CALL / DIST.
+- APRS beacon support was added with configurable interval, symbol and comment.
+- APRS ALERT was added for selected callsigns, mobile stations and WX stations.
+- LED alert support was added, including duration and blink timing parameters.
+- APRS ALERT popup is now blocked while the TFT settings menu is active.
+
+6) Weather, forecast, propagation and QRZ
+- A current weather screen was added.
+- A forecast screen was added, including PM2.5 / PM10 readings.
+- A Propagation screen/tab and the /api/propagation API endpoint were added.
+- MUF parsing and display from hamqsl solarxml were added.
+- QRZ usage was expanded to enrich spots with country, locator and distance.
+
+7) TFT / device UI
+- Added settings for brightness, TFT language, table size, auto-switch and screen order.
+- Added TFT Rotation, Touch Rotation, TFT color inversion and touch axis swap modes.
+- Added long-press menu for brightness and TFT language change.
+- Expanded BMP support from LittleFS, including 32-bit files and startup background from /logo.bmp.
+- Updated startup screens and version labels to 1.22.
+- Limited selected automatic actions while UNLIS HUNTER screen is active, to avoid interrupting that screen.
+
+8) Web panel
+- Added a full web panel in Polish and English.
+- Added tabs for DXSPOT, POTA, HAMALERT, APRS, ALERT, TFT, Settings and Manual.
+- Added a new Propagation tab.
+- Updated HAMALERT configuration logic so host/port/login/password fields are optional.
+- If HAMALERT login/password are empty, HAMALERT is treated as disabled.
+
+9) Stability and performance
+- Added separate mutexes for POTA and HAMALERT spot lists.
+- Reworked data read/update sections to reduce the risk of collisions.
+- Added extra safeguards for UI work and spot list updates.
+
+10) Additional functional fixes
+- Added full support for half-hour time zones, for example 2.5.
+- The web panel now sends timezone as float, and firmware stores/reads it correctly.
+- Updated form descriptions and made small TFT layout corrections.
+
+Migration notes:
+- After updating from 1.2 to 1.22, it is recommended to open the web configuration and save settings again.
+- This is especially relevant for DX Cluster, WiFi, APRS, TFT and newly added configuration fields.
+- Multi-select filters for DX / POTA / HAMALERT are runtime-only and return to default after restart.

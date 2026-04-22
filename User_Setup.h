@@ -53,13 +53,13 @@
 #define TOUCH_CS 33
 #endif
 #ifndef TOUCH_IRQ
-#define TOUCH_IRQ 36 // dla zewnętrznego TFT ILI9341 użyć 35
+#define TOUCH_IRQ 36 //domyślnie 36 a dla zewnętrznego TFT ILI9341 użyć 35
 #endif
 #ifndef TOUCH_MOSI
 #define TOUCH_MOSI 32
 #endif
 #ifndef TOUCH_MISO
-#define TOUCH_MISO 39 // dla zewnętrznego TFT ILI9341 użyć 27
+#define TOUCH_MISO 39 //domyślnie 39 a dla zewnętrznego TFT ILI9341 użyć 27
 #endif
 #ifndef TOUCH_CLK
 #define TOUCH_CLK 25

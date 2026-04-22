@@ -113,6 +113,13 @@ Projekt obsługuje 11 ekranów (kolejność konfigurowalna, każdy slot może by
 - PL: `INSTRUKCJA.txt` oraz `data/instrukcja.txt`
 - EN: `data/manual.txt` oraz `readmeEN.md`
 
+## Pliki zmian
+
+- Zmiany 1.22 vs 1.2: `ZMIANY_1.22_vs_1.2.txt`
+- Zmiany 1.22 vs 1.21: `ZMIANY_1.22_vs_1.21.txt`
+- Changes 1.22 vs 1.2: `CHANGES_1.22_vs_1.2.txt`
+- Changes 1.22 vs 1.21: `CHANGES_1.22_vs_1.21.txt`
+
 ## Szybkie troubleshooting
 
 - WWW nie otwiera się:

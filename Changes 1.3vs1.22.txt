@@ -1,0 +1,154 @@
+ESP32-HAM-CLOCK
+Changes 1.3 vs 1.22
+
+Comparison base:
+- Reference (original GitHub code): tag v1.2.2
+- Compared with: current local workspace state
+- Method: direct code diff (firmware + web panel + config), not only today's edits
+
+============================================================
+PL (Polski)
+============================================================
+
+Najwazniejsze zmiany i nowosci:
+
+1) TFT / UI urzadzenia (motyw i czytelnosc)
+- Dodano tryby stylu TFT: dark/light (ciemny/jasny) i wspolna palete UI.
+- Wiele ekranow zostalo dostosowanych do obu styli (kolory tla, tekstu, ramek, tabel i naglowkow).
+- Dodano nocne przyciemnianie TFT (night dimming, procentowo), z zapisem do NVS.
+- Dopracowano spojnosc kolorow i akcentow na ekranach list/tabel.
+
+2) GPS / Lokalizacja / UART2
+- Dodano ekran LOKALIZACJA (informacje GPS + zapis wspolrzednych).
+- Dodano opcje use_gps_if_active (uzycie aktywnego GPS jako zrodla pozycji dla uslug/filtrow/beaconu).
+- Rozszerzono konfiguracje UART2: tryb, baud, data bits, parity, stop bits, modul podlaczony.
+- Rozszerzono logike portu UART2 i mapowanie modulow (gps/aprs_tnc/aprs_tnc_kiss/bridge).
+- Ustawienia GPS/UART2 sa odczytywane i zapisywane do NVS oraz API.
+
+3) APRS / UART2 / TNC
+- Dodano nowy typ modulu UART2: APRS_TNC-KISS (wraz z aliasami rozpoznawania nazwy).
+- Rozszerzono logike startowa modemu APRS:
+  - dla APRS-TNC2: RESTART po 30 s,
+  - dla APRS_TNC-KISS: KISS ON po 30 s, potem RESTART po 1 s.
+- Dodano pelna obsluge transmisji beaconu APRS przez KISS (AX.25 + KISS frame).
+- Dla KISS TX ustawiono domyslna sciezke RF New-N: WIDE1-1,WIDE2-1.
+- Beacon w trybie KISS wysylany jest tylko do TNC-KISS (bez wysylki do APRS-IS).
+- Dodano obsluge 2-liniowego formatu Yaesu Packet Monitor w trybie APRS-TNC2:
+  - wykrycie naglowka z ] <UI ... >:
+  - sklejenie z kolejna linia payloadu,
+  - konwersja do klasycznej tekstowej ramki APRS.
+
+4) Filtrowanie i sortowanie (ekrany/listy)
+- Rozszerzono trwale zapisywanie ustawien filtrow i sortowania do NVS:
+  - s2_mode, s2_band (DX),
+  - s6_sort (APRS),
+  - s7_mode, s7_band (POTA),
+  - s8_mode, s8_band (HAMALERT).
+- Dodano walidacje masek filtrow po starcie (przyciecie do dozwolonych bitow), co poprawia stabilnosc po migracjach ustawien.
+- Zachowanie filtrow/sortowania po restarcie jest bardziej przewidywalne i spojne.
+
+5) Zmiany funkcji (zgrubny opis)
+- serviceAprsTncBootRestart(...): nowa sekwencja KISS ON + RESTART dla modulu KISS.
+- sendAprsPositionToKiss(): budowa i wysylka ramki AX.25/KISS z danymi beaconu.
+- serviceAprsBeaconTx(...): routing beaconu zalezny od trybu (APRS-IS vs TNC-KISS).
+- handleUartAprsTextLine(...): dodane laczenie 2-liniowych ramek Yaesu do jednego pakietu APRS.
+- getServiceCoordinatesForServices(...): wspolna logika wyboru zrodla pozycji (manual/GPS).
+
+6) Alerty i funkcje dodatkowe
+- Dodano ekran popup "APRS BECONING..." przy wysylce beaconu KISS.
+- Popup pokazuje dane wysylanej stacji/ramki i jest wyswietlany przez 2 sekundy.
+- Ujednolicono opisy modulow APRS na TFT (m.in. APRS-TNC2-UART, APRS-TNC-KISS).
+- Rozszerzono zapis/odczyt ustawien alertow pogodowych (storm/wind/threshold).
+
+7) Panel WWW (PL i EN)
+- Dodano konfiguracje zwiazana z nowymi opcjami GPS/UART2 (m.in. baud/parity/stop bits/use_gps_if_active).
+- Dodano suwak night dimming i obsluge nowych pol konfiguracyjnych TFT.
+- Dodano ekran LOKALIZACJA do listy konfigurowalnej kolejnosci ekranow.
+- Dodano opcje modulu APRS_TNC-KISS do wyboru w konfiguracji.
+- Dodano mapowanie aliasow modulu KISS w logice formularza.
+- Zmieniono opis checkboxa beaconu na APRS-IS/TNC-KISS.
+- Uaktualniono oznaczenia wersji i daty do v1.3.0 / 05.07.2026.
+
+8) Build / konfiguracja projektu
+- Ustawiono konkretna wersje platformy: platformio/espressif32@6.12.0.
+- Dodano niestandardowa tabele partycji: partitions_4mb_ota_1600k.csv.
+- Dodano dodatkowy skrypt pre-build: patch_tftespi_smooth_font.py.
+- Ustawiono monitor_encoding = utf-8.
+
+9) Dokumentacja
+- Zaktualizowano pliki instrukcji do wersji 1.3 i daty 05.07.2026.
+- Usunieto stare odniesienia do poprzednich changelogow 1.22 w czesci dokumentacji.
+
+
+============================================================
+EN (English)
+============================================================
+
+Main changes and new features:
+
+1) TFT / device UI (theme and readability)
+- Added TFT style modes: dark/light, with unified UI palette handling.
+- Multiple screens were updated to support both styles (background, text, frame, table and header colors).
+- Added night dimming control (percentage) for TFT, persisted in NVS.
+- Improved visual consistency for list/table rendering.
+
+2) GPS / Location / UART2
+- Added LOCATION screen (GPS info + coordinate save workflow).
+- Added use_gps_if_active option (active GPS can be used as position source for services/filters/beaconing).
+- Extended UART2 configuration: mode, baud, data bits, parity, stop bits, connected module.
+- Expanded UART2 runtime logic and module mapping (gps/aprs_tnc/aprs_tnc_kiss/bridge).
+- GPS/UART2 settings are persisted through NVS and exposed via API.
+
+3) APRS / UART2 / TNC
+- Added a new UART2 module type: APRS_TNC-KISS (including alias-based name detection).
+- Extended APRS modem startup behavior:
+  - APRS-TNC2: RESTART after 30 s,
+  - APRS_TNC-KISS: KISS ON after 30 s, then RESTART after 1 s.
+- Added full APRS beacon transmission via KISS (AX.25 + KISS frame).
+- KISS TX now uses default RF New-N path: WIDE1-1,WIDE2-1.
+- In KISS mode, beacon TX is routed only to TNC-KISS (not to APRS-IS).
+- Added support for Yaesu 2-line Packet Monitor format in APRS-TNC2 mode:
+  - detect header line with ] <UI ... >:
+  - combine with next payload line,
+  - convert into a standard APRS text frame.
+
+4) Filtering and sorting (screens/lists)
+- Extended persistent storage of filter/sort state in NVS:
+  - s2_mode, s2_band (DX),
+  - s6_sort (APRS),
+  - s7_mode, s7_band (POTA),
+  - s8_mode, s8_band (HAMALERT).
+- Added filter mask sanitization on load (allowed-bit clamping), improving stability after settings migrations.
+- Filter/sort state survives restarts more consistently.
+
+5) Function-level changes (high-level)
+- serviceAprsTncBootRestart(...): new KISS ON + RESTART sequence for KISS module.
+- sendAprsPositionToKiss(): builds and sends AX.25/KISS beacon frames.
+- serviceAprsBeaconTx(...): mode-based beacon routing (APRS-IS vs TNC-KISS).
+- handleUartAprsTextLine(...): adds Yaesu 2-line frame merge into one APRS packet.
+- getServiceCoordinatesForServices(...): centralized position-source selection (manual/GPS).
+
+6) Alerts and additional behavior
+- Added an "APRS BECONING..." popup during KISS beacon transmission.
+- Popup shows transmitted station/frame data and is visible for 2 seconds.
+- APRS module labels on TFT were aligned (including APRS-TNC2-UART, APRS-TNC-KISS).
+- Extended weather-alert settings persistence (storm/wind/threshold).
+
+7) Web panel (PL and EN)
+- Added UI/config support for new GPS/UART2 options (including baud/parity/stop bits/use_gps_if_active).
+- Added night dimming slider and handling in the config payload.
+- Added LOCATION to configurable screen-order options.
+- Added APRS_TNC-KISS module option in configuration.
+- Added KISS alias mapping in form logic.
+- Updated beacon checkbox text to APRS-IS/TNC-KISS.
+- Updated version/date labels to v1.3.0 / 05.07.2026.
+
+8) Build / project configuration
+- Pinned platform to: platformio/espressif32@6.12.0.
+- Added custom partitions table: partitions_4mb_ota_1600k.csv.
+- Added extra pre-build script: patch_tftespi_smooth_font.py.
+- Set monitor_encoding = utf-8.
+
+9) Documentation
+- Updated instruction files to version 1.3 and date 05.07.2026.
+- Removed old references to earlier 1.22 changelogs in parts of documentation.

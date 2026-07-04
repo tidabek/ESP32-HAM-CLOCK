@@ -1,4 +1,4 @@
-ESP32-HAM-CLOCK v1.2 (04.03.2026)
+ESP32-HAM-CLOCK v1.3 (05.07.2026)
 Autor: Konrad Wisniewski SP3KON (z użyciem AI)
 Kontakt: sp3kon@gmail.com
 

@@ -1,0 +1,63 @@
+Konfiguracja HC-05 <-> HC-05 (Master-Slave)
+
+Cel:
+- Jeden HC-05 pracuje jako SLAVE.
+- Drugi HC-05 pracuje jako MASTER i laczy sie automatycznie ze SLAVE.
+- Modul podlaczony do ESP32 (UART2) daje strumien danych jak zwykly port szeregowy.
+
+Wazne uwagi:
+- Do trybu AT zwykle trzeba ustawic pin KEY/EN przed uruchomieniem modulu.
+- W pelnym trybie AT wiele HC-05 pracuje z predkoscia 38400.
+- W trybie danych ustawiasz predkosc komenda AT+UART=... (np. 9600).
+- Klony HC-05 moga miec drobne roznice komend AT.
+
+========================================
+1) Konfiguracja modulu SLAVE
+========================================
+
+AT
+AT+ORGL
+AT+ROLE=0
+AT+PSWD=1234
+AT+UART=9600,0,0
+AT+ADDR?
+
+Zapisz adres zwrocony przez AT+ADDR? (np. 98D3,31,FC20C7)
+
+========================================
+2) Konfiguracja modulu MASTER
+========================================
+
+AT
+AT+ORGL
+AT+ROLE=1
+AT+CMODE=0
+AT+PSWD=1234
+AT+UART=9600,0,0
+AT+BIND=98D3,31,FC20C7
+AT+PAIR=98D3,31,FC20C7,20
+AT+LINK=98D3,31,FC20C7
+
+Uwaga:
+- Wstaw rzeczywisty adres SLAVE zamiast przykladu.
+- Niektore firmware oczekuja innego formatu adresu lub nie wspieraja PAIR/LINK identycznie.
+
+========================================
+3) Po konfiguracji
+========================================
+
+- Zrestartuj oba moduly do trybu danych.
+- Lokalny HC-05 podlacz do UART2 ESP32 (zgodnie z poziomami napiec i okablowaniem TX/RX).
+- Drugi HC-05 podlacz do urzadzenia zdalnego.
+- Po zestawieniu lacza ESP32 czyta dane jako normalny UART.
+
+========================================
+4) Szybka diagnostyka
+========================================
+
+Jesli brak polaczenia:
+- Sprawdz czy MASTER ma ROLE=1 i CMODE=0.
+- Sprawdz zgodnosc PIN (PSWD) po obu stronach.
+- Sprawdz poprawny adres w BIND.
+- Sprawdz predkosc UART po obu stronach (AT+UART).
+- Sprawdz, czy modul na pewno jest w trybie danych (nie AT).

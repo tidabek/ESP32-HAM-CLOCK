@@ -15,6 +15,8 @@
  * Tak samo z APRS.fi  - tylko odczyt.
  */
 
+#include <Arduino.h>
+
 // Wczesne forward-deklaracje, aby auto-prototypowanie Arduino znało typy używane w sygnaturach
 enum ScreenType : uint8_t;    // pełna definicja niżej
 enum Screen6ViewMode : uint8_t;
@@ -22,6 +24,7 @@ struct DXSpot;                // pełna definicja niżej
 struct APRSStation;           // pełna definicja niżej
 struct AprsWxDecoded;         // pełna definicja niżej
 struct PropagationData;       // pełna definicja niżej
+struct WeatherAlertInfo;      // pełna definicja niżej
 
 // Forward declarations for UnlisHunter state used before global definitions.
 extern bool unlisRunning;
@@ -60,6 +63,7 @@ void normalizePolish(String &text) {
 #include <WebServer.h>
 #include <Preferences.h>
 #include <time.h>
+#include <sys/time.h>
 #include <ArduinoJson.h>
 #include "esp_rom_sys.h"
 #include <HTTPClient.h>
@@ -83,13 +87,61 @@ enum ScreenType : uint8_t {
   SCREEN_APRS_RADAR = 9,
   SCREEN_MATRIX_CLOCK = 10,
   SCREEN_UNLIS_HUNTER = 11,
-  SCREEN_WEATHER_FORECAST = 12
+  SCREEN_WEATHER_FORECAST = 12,
+  SCREEN_LOKALIZACJA = 13
 };
 
 #define LOG_VERBOSE false
 #define LOGV_PRINT(x) do { if (LOG_VERBOSE) Serial.print(x); } while (0)
 #define LOGV_PRINTLN(x) do { if (LOG_VERBOSE) Serial.println(x); } while (0)
 #define LOGV_PRINTF(...) do {} while (0)
+
+// Monitor RAM na Serial (kontrolnie co 1 s).
+// Ustaw false, gdy logi nie są potrzebne.
+#define RAM_MONITOR_ENABLED false
+#define RAM_MONITOR_INTERVAL_MS 1000UL
+
+static void logRamUsage(unsigned long nowMs) {
+  if (!RAM_MONITOR_ENABLED) {
+    return;
+  }
+
+  static unsigned long lastRamLogMs = 0;
+  if ((nowMs - lastRamLogMs) < RAM_MONITOR_INTERVAL_MS) {
+    return;
+  }
+  lastRamLogMs = nowMs;
+
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  const uint32_t minFreeHeap = ESP.getMinFreeHeap();
+  const uint32_t maxAllocHeap = ESP.getMaxAllocHeap();
+
+#if CONFIG_SPIRAM_SUPPORT
+  const uint32_t freePsram = ESP.getFreePsram();
+  const uint32_t totalPsram = ESP.getPsramSize();
+#else
+  const uint32_t freePsram = 0;
+  const uint32_t totalPsram = 0;
+#endif
+
+  Serial.printf("[RAM] free=%u min=%u maxAlloc=%u psram=%u/%u\n",
+                freeHeap,
+                minFreeHeap,
+                maxAllocHeap,
+                freePsram,
+                totalPsram);
+}
+
+// W setup() są długie, blokujące odcinki (splash/delay), więc loop jeszcze nie loguje.
+// Ta pomocnicza funkcja utrzymuje periodyczne logi RAM także przed startem loop().
+static void delayWithRamLogs(unsigned long delayMs) {
+  unsigned long startMs = millis();
+  while ((millis() - startMs) < delayMs) {
+    logRamUsage(millis());
+    delay(50);
+    yield();
+  }
+}
 
 // ========== WYŚWIETLACZ TFT (ESP32-2432S028) ==========
 #ifdef ENABLE_TFT_DISPLAY
@@ -117,21 +169,25 @@ TFT_eSPI tft = TFT_eSPI();
 #define MIN_BACKLIGHT_PERCENT 10
 #define TFT_BACKLIGHT 100
 int backlightPercent = TFT_BACKLIGHT;
+int tftNightDimmingPercent = 0;
+int currentBacklightAppliedPercent = TFT_BACKLIGHT;
+unsigned long lastBacklightDayNightCheckMs = 0;
+const unsigned long BACKLIGHT_DAY_NIGHT_CHECK_INTERVAL_MS = 5UL * 60UL * 1000UL; // 5 min
 
 // ========== DOTYK (XPT2046 - ESP32-2432S028R) ==========
 #ifndef TOUCH_CS
 #define TOUCH_CS 33
 #endif
 #ifndef TOUCH_IRQ
-#define TOUCH_IRQ 36 // dla zewnętrznego TFT ILI9341 użyć 35
-//#define TOUCH_IRQ 35 // dla zewnętrznego TFT ILI9341
+//#define TOUCH_IRQ 36 // domyślnie 36 a dla zewnętrznego TFT ILI9341 użyć 35
+#define TOUCH_IRQ 35 // dla zewnętrznego TFT ILI9341
 #endif
 #ifndef TOUCH_MOSI
 #define TOUCH_MOSI 32
 #endif
 #ifndef TOUCH_MISO
-#define TOUCH_MISO 39 // dla zewnętrznego TFT ILI9341 użyć 27
-//#define TOUCH_MISO 27 // dla zewnętrznego TFT ILI9341
+//#define TOUCH_MISO 39 // domyślnie 39 a dla zewnętrznego TFT ILI9341 użyć 27
+#define TOUCH_MISO 27 // dla zewnętrznego TFT ILI9341
 #endif
 #ifndef TOUCH_CLK
 #define TOUCH_CLK 25
@@ -171,7 +227,7 @@ bool bootSequenceActive = true;
 bool littleFsReady = false;
 
 // ========== SYSTEM MENU I NAWIGACJI ==========
-const int SCREEN_PAGE_COUNT = 11;
+const int SCREEN_PAGE_COUNT = 12;
 const ScreenType DEFAULT_SCREEN_ORDER[SCREEN_PAGE_COUNT] = {
   SCREEN_HAM_CLOCK,
   SCREEN_DX_CLUSTER,
@@ -183,7 +239,8 @@ const ScreenType DEFAULT_SCREEN_ORDER[SCREEN_PAGE_COUNT] = {
   SCREEN_WEATHER_FORECAST,
   SCREEN_POTA_CLUSTER,
   SCREEN_HAMALERT_CLUSTER,
-  SCREEN_MATRIX_CLOCK
+  SCREEN_MATRIX_CLOCK,
+  SCREEN_LOKALIZACJA
 };
 
 ScreenType screenOrder[SCREEN_PAGE_COUNT] = {
@@ -197,7 +254,8 @@ ScreenType screenOrder[SCREEN_PAGE_COUNT] = {
   SCREEN_WEATHER_FORECAST,
   SCREEN_POTA_CLUSTER,
   SCREEN_HAMALERT_CLUSTER,
-  SCREEN_MATRIX_CLOCK
+  SCREEN_MATRIX_CLOCK,
+  SCREEN_LOKALIZACJA
 };
 ScreenType currentScreen = SCREEN_OFF;  // Ustawiany po wczytaniu preferencji
 bool inMenu = false;    // Czy jesteśmy w menu wewnętrznym strony
@@ -207,6 +265,7 @@ bool tftAutoSwitchEnabled = false;
 int tftAutoSwitchTimeSec = DEFAULT_TFT_SWITCH_TIME_SEC;
 unsigned long tftAutoSwitchLastMs = 0;
 ScreenType tftAutoSwitchLastScreen = SCREEN_OFF;
+unsigned long autoswitchPausedUntilMs = 0; // pauza autoswitch po dotknięciu środka ekranu
 unsigned long lastScreenUpdate = 0;
 const unsigned long SCREEN_UPDATE_INTERVAL = 100; // Aktualizuj ekran co 100ms
 const unsigned long DX_SCREEN_MIN_REDRAW_MS = 5000; // Ogranicz zapis tabeli DX do max 1 raz/5s
@@ -216,6 +275,7 @@ unsigned long lastScreen4UpdateMs = 0;
 unsigned long lastScreen5UpdateMs = 0;
 unsigned long lastScreen7UpdateMs = 0;
 unsigned long lastScreen8UpdateMs = 0;
+unsigned long lastScreenLocationUpdateMs = 0;
 bool screen1HeaderNeedsRedraw = true;
 
 const int TFT_TABLE_TOP = 32;
@@ -321,6 +381,28 @@ enum TftLang : uint8_t {
 };
 uint8_t tftLanguage = TFT_LANG_PL;
 
+enum TftStyleMode : uint8_t {
+  TFT_STYLE_DARK = 0,
+  TFT_STYLE_LIGHT = 1
+};
+uint8_t tftStyleMode = TFT_STYLE_DARK;
+
+struct TftUiPalette {
+  uint16_t bg;
+  uint16_t fg;
+  uint16_t muted;
+  uint16_t accent;
+  uint16_t rowAlt;
+};
+
+TftUiPalette tftUiPalette = {
+  TFT_BLACK,
+  TFT_WHITE,
+  TFT_LIGHTGREY,
+  0xFD20,
+  TFT_TABLE_ALT_ROW_COLOR
+};
+
 enum DxTableSizeMode : uint8_t {
   DX_TABLE_SIZE_NORMAL = 0,
   DX_TABLE_SIZE_ENLARGED = 1
@@ -328,14 +410,44 @@ enum DxTableSizeMode : uint8_t {
 uint8_t dxTableSizeMode = DX_TABLE_SIZE_NORMAL;
 
 // Font z polskimi znakami dla daty/dnia tygodnia
-#define ROBOTO_FONT10_NAME "/fonts/Inter-Regular10"
-#define ROBOTO_FONT10_FILE "/fonts/Inter-Regular10.vlw"
-#define ROBOTO_FONT12_NAME "/fonts/Inter-Regular12"
-#define ROBOTO_FONT12_FILE "/fonts/Inter-Regular12.vlw"
-#define ROBOTO_FONT20_NAME "/fonts/Inter-Regular20"
-#define ROBOTO_FONT20_FILE "/fonts/Inter-Regular20.vlw"
-#define ROBOTO_FONT24_NAME "/fonts/Inter-Regular24"
-#define ROBOTO_FONT24_FILE "/fonts/Inter-Regular24.vlw"
+#define ROBOTO_FONT10_NAME "/fonts/Roboto10"
+#define ROBOTO_FONT10_FILE "/fonts/Roboto10.vlw"
+#define ROBOTO_FONT12_NAME "/fonts/Roboto12"
+#define ROBOTO_FONT12_FILE "/fonts/Roboto12.vlw"
+#define ROBOTO_FONT20_NAME "/fonts/Roboto20"
+#define ROBOTO_FONT20_FILE "/fonts/Roboto20.vlw"
+
+static bool tryLoadSmoothFont(const char *fontName, const char *fontFile) {
+  if (!littleFsReady || !LittleFS.exists(fontFile)) {
+    return false;
+  }
+  if (tft.fontLoaded) {
+    tft.unloadFont();
+  }
+  tft.loadFont(fontName, LittleFS);
+  return tft.fontLoaded;
+}
+
+// Po aktualizacji frameworku pierwszy loadFont bywa niestabilny.
+// Wariant "light" celowo robi tylko pojedynczy warmup fontu startowego,
+// aby nie generować burstu otwarć plików LittleFS (FD).
+static bool warmupSmoothFonts() {
+  if (!littleFsReady) {
+    return false;
+  }
+
+  if (!LittleFS.exists(ROBOTO_FONT20_FILE)) {
+    return false;
+  }
+
+  const bool loaded = tryLoadSmoothFont(ROBOTO_FONT20_NAME, ROBOTO_FONT20_FILE);
+  if (tft.fontLoaded) {
+    tft.unloadFont();
+  }
+  yield();
+  return loaded;
+}
+
 
 enum TrKey : uint8_t {
   TR_TIME_SHORT = 0,
@@ -446,6 +558,19 @@ static uint8_t tftLangFromCode(const String &code) {
   return TFT_LANG_PL;
 }
 
+static const char* tftStyleToCode(uint8_t style) {
+  return (style == TFT_STYLE_LIGHT) ? "light" : "dark";
+}
+
+static uint8_t tftStyleFromCode(const String &code) {
+  String up = code;
+  up.toLowerCase();
+  if (up == "light" || up == "jasny" || up == "white") {
+    return TFT_STYLE_LIGHT;
+  }
+  return TFT_STYLE_DARK;
+}
+
 static const char* dxTableSizeToCode(uint8_t mode) {
   return (mode == DX_TABLE_SIZE_ENLARGED) ? "enlarged" : "normal";
 }
@@ -491,11 +616,39 @@ static int getAprsTableMaxRows() {
   return isTableNavFooterVisible(SCREEN_APRS_IS) ? 6 : 7;
 }
 
+static bool isTftStyleLight() {
+  return tftStyleMode == TFT_STYLE_LIGHT;
+}
+
+static uint16_t tftHeaderBgColor() {
+  return tftUiPalette.accent;
+}
+
+static uint16_t tftHeaderTextColor() {
+  return isTftStyleLight() ? tftUiPalette.fg : TFT_BLACK;
+}
+
+static uint16_t tftTableFreqColor() {
+  return isTftStyleLight() ? tftUiPalette.fg : TFT_YELLOW;
+}
+
+static uint16_t tftTableModeColor() {
+  return isTftStyleLight() ? tftUiPalette.fg : TFT_GREEN;
+}
+
+static uint16_t tftTableAccentTextColor() {
+  return isTftStyleLight() ? tftUiPalette.fg : menuThemeColor;
+}
+
 static uint16_t getAprsCallsignColorForEnlarged(const APRSStation &station) {
+  if (isTftStyleLight()) {
+    return tftUiPalette.fg;
+  }
   String symbolShort = getAPRSSymbolShort(station);
   if (symbolShort == "HOUSE") return TFT_YELLOW;
-  if (symbolShort == "HUMAN") return TFT_BLUE;
+  if (symbolShort == "HUMAN") return 0x3C1F;
   if (symbolShort == "CAR") return TFT_RED;
+  if (symbolShort == "HAMCLOCK") return TFT_ORANGE;
   return TFT_WHITE;
 }
 #endif
@@ -506,6 +659,21 @@ static uint16_t getAprsCallsignColorForEnlarged(const APRSStation &station) {
 uint8_t menuThemeHue = DEFAULT_MENU_THEME_HUE;
 uint16_t menuThemeColor = DEFAULT_MENU_THEME_COLOR;
 
+static void applyTftUiPalette() {
+  tftUiPalette.accent = menuThemeColor;
+  if (isTftStyleLight()) {
+    tftUiPalette.bg = TFT_WHITE;
+    tftUiPalette.fg = TFT_BLACK;
+    tftUiPalette.muted = TFT_DARKGREY;
+    tftUiPalette.rowAlt = 0xDEFB;  // Jasnoszary dla parzystych wierszy tabel.
+  } else {
+    tftUiPalette.bg = TFT_BLACK;
+    tftUiPalette.fg = TFT_WHITE;
+    tftUiPalette.muted = TFT_LIGHTGREY;
+    tftUiPalette.rowAlt = TFT_TABLE_ALT_ROW_COLOR;
+  }
+}
+
 // Filtry ekranu 2 (TFT)
 enum Screen2FilterMode {
   FILTER_MODE_ALL = 0,
@@ -513,19 +681,22 @@ enum Screen2FilterMode {
   FILTER_MODE_SSB = 2,
   FILTER_MODE_DIGI = 3
 };
-Screen2FilterMode screen2FilterMode = FILTER_MODE_ALL;
-int screen2FilterBandIndex = 0; // 0 = ALL
+const uint8_t FILTER_MODE_BIT_CW = 1 << 0;
+const uint8_t FILTER_MODE_BIT_SSB = 1 << 1;
+const uint8_t FILTER_MODE_BIT_DIGI = 1 << 2;
+uint8_t screen2FilterModeMask = 0;
+uint16_t screen2FilterBandMask = 0; // 0 = ALL
 const char *SCREEN2_FILTER_BANDS[] = {"ALL", "160m", "80m", "40m", "20m", "17m", "15m", "12m", "10m"};
 const int SCREEN2_FILTER_BANDS_COUNT = sizeof(SCREEN2_FILTER_BANDS) / sizeof(SCREEN2_FILTER_BANDS[0]);
 const size_t COUNTRY_COL_MAX_LEN = 19;
 
 // Filtry ekranu 7 (POTA)
-Screen2FilterMode screen7FilterMode = FILTER_MODE_ALL;
-int screen7FilterBandIndex = 0; // 0 = ALL
+uint8_t screen7FilterModeMask = 0;
+uint16_t screen7FilterBandMask = 0; // 0 = ALL
 
 // Filtry ekranu 8 (HAMALERT)
-Screen2FilterMode screen8FilterMode = FILTER_MODE_ALL;
-int screen8FilterBandIndex = 0; // 0 = ALL
+uint8_t screen8FilterModeMask = 0;
+uint16_t screen8FilterBandMask = 0; // 0 = ALL
 const char *SCREEN8_FILTER_BANDS[] = {"ALL", "160m", "80m", "40m", "20m", "17m", "15m", "12m", "10m", "VHF", "UHF", "SHF"};
 const int SCREEN8_FILTER_BANDS_COUNT = sizeof(SCREEN8_FILTER_BANDS) / sizeof(SCREEN8_FILTER_BANDS[0]);
 
@@ -569,6 +740,7 @@ int brightnessMenuValue = 100;
 ScreenType brightnessMenuPrevScreen = SCREEN_HAM_CLOCK;
 bool brightnessMenuPrevInMenu = false;
 uint8_t brightnessMenuPrevThemeHue = DEFAULT_MENU_THEME_HUE;
+uint8_t brightnessMenuPrevStyleMode = TFT_STYLE_DARK;
 int brightnessMenuPrevBacklight = TFT_BACKLIGHT;
 unsigned long brightnessMenuOpenedMs = 0;
 unsigned long brightnessMenuTouchStartMs = 0;
@@ -604,7 +776,7 @@ int touchCalNewYMax = TOUCH_Y_MAX;
 #define MAX_SPOTS 50  // Bufor 50 ostatnich spotów
 #define MAX_POTA_SPOTS 30  // Bufor 30 ostatnich spotów (TFT pokaże max 10)
 #define GMT_OFFSET_SEC 0  // UTC
-#define DEFAULT_TIMEZONE_HOURS 0
+#define DEFAULT_TIMEZONE_HOURS 0.0f
 #define DEFAULT_CALLSIGN "SWL"
 #define DEFAULT_OPENWEBRX_URL "http://okno.ddns.net:8078"
 #define PROPAGATION_URL "https://www.hamqsl.com/solarxml.php"
@@ -612,6 +784,7 @@ const unsigned long PROPAGATION_FETCH_INTERVAL_MS = 60UL * 60UL * 1000UL; // 60 
 const unsigned long PROPAGATION_FETCH_RETRY_MS = 5UL * 60UL * 1000UL;      // 5 min retry on error
 const unsigned long WEATHER_FETCH_INTERVAL_MS = 10UL * 60UL * 1000UL;      // 10 min
 const unsigned long WEATHER_FETCH_RETRY_MS = 2UL * 60UL * 1000UL;          // 2 min retry on error
+const unsigned long NETWORK_SERVICES_START_DELAY_MS = 5000UL;               // 5s opóźnienia po WiFi dla stabilizacji LWIP
 const unsigned long QRZ_LOOKUP_INTERVAL_DEFAULT_MS = 3000;                 // 3s bazowy interwał lookupów
 const unsigned long QRZ_LOOKUP_INTERVAL_DX_MS = 2000;                      // 2s na ekranie DX (tak samo jak POTA)
 const unsigned long QRZ_LOOKUP_INTERVAL_POTA_MS = 2000;                    // 2s na ekranie POTA
@@ -662,6 +835,7 @@ struct PropagationData {
   String sfi;
   String kindex;
   String aindex;
+  String muf;
   String updated;
   String hfBandLabel[4];
   String hfBandFreq[4];
@@ -705,6 +879,7 @@ struct WeatherData {
   bool detailValid[DETAIL_COLS] = {false, false, false, false, false};
   float nightTempC[2] = {0.0f, 0.0f};
   bool nightTempValid[2] = {false, false};
+  String forecastError;
   String updated;
   bool valid = false;
   String lastError = "";
@@ -747,6 +922,9 @@ int potaSpotCount = 0;
 DXSpot hamalertSpots[MAX_POTA_SPOTS];
 int hamalertSpotCount = 0;
 SemaphoreHandle_t dxSpotsMutex = nullptr;
+SemaphoreHandle_t potaSpotsMutex = nullptr;
+SemaphoreHandle_t hamalertSpotsMutex = nullptr;
+SemaphoreHandle_t weatherDataMutex = nullptr;
 
 const size_t DX_TIME_MAX_LEN = 24;
 const size_t DX_CALLSIGN_MAX_LEN = 16;
@@ -799,6 +977,42 @@ static inline void unlockDxSpots() {
   }
 }
 
+static inline void lockPotaSpots() {
+  if (potaSpotsMutex != nullptr) {
+    xSemaphoreTake(potaSpotsMutex, portMAX_DELAY);
+  }
+}
+
+static inline void unlockPotaSpots() {
+  if (potaSpotsMutex != nullptr) {
+    xSemaphoreGive(potaSpotsMutex);
+  }
+}
+
+static inline void lockHamalertSpots() {
+  if (hamalertSpotsMutex != nullptr) {
+    xSemaphoreTake(hamalertSpotsMutex, portMAX_DELAY);
+  }
+}
+
+static inline void unlockHamalertSpots() {
+  if (hamalertSpotsMutex != nullptr) {
+    xSemaphoreGive(hamalertSpotsMutex);
+  }
+}
+
+static inline void lockWeatherData() {
+  if (weatherDataMutex != nullptr) {
+    xSemaphoreTake(weatherDataMutex, portMAX_DELAY);
+  }
+}
+
+static inline void unlockWeatherData() {
+  if (weatherDataMutex != nullptr) {
+    xSemaphoreGive(weatherDataMutex);
+  }
+}
+
 // Formatuje czas spotu do postaci "HH:MM" niezależnie od wejściowego formatu
 String formatSpotUtc(String raw) {
   raw.trim();
@@ -847,7 +1061,7 @@ unsigned long lastHamalertFetchMs = 0;
 #define DEFAULT_APRS_PASSCODE 00000
 #define DEFAULT_APRS_SSID 0
 #define DEFAULT_APRS_FILTER_RADIUS 50  // Promień w km (domyślnie 50, zakres 1-50)
-#define MAX_APRS_STATIONS 20  // Maksymalna liczba stacji do wyświetlenia (bufor dla WWW)
+#define MAX_APRS_STATIONS 30  // Maksymalna liczba stacji do wyświetlenia (bufor dla WWW)
 #define MAX_APRS_DISPLAY_LCD 11  // Maksymalna liczba stacji na ekranie LCD
 
 // Zmienne konfiguracyjne APRS-IS
@@ -860,6 +1074,8 @@ int aprsFilterRadius = DEFAULT_APRS_FILTER_RADIUS;  // PromieĹ„ w km (0-30)
 // Uwaga: APRS uĹĽywa wspĂłĹ‚rzÄ™dnych z sekcji "Moja Stacja" (userLat, userLon)
 
 const unsigned long APRS_POSITION_FIRST_DELAY_MS = 60UL * 1000UL; // pierwszy beacon po 1 minucie
+const unsigned long APRS_FILTER_REFRESH_MIN_INTERVAL_MS = 30000UL; // nie odswiezaj filtra czesciej niz co 30s
+const float APRS_FILTER_REFRESH_MOVE_KM = 1.0f; // odswiez filtr po przesunieciu pozycji o >= 1 km
 const int DEFAULT_APRS_INTERVAL_MIN = 29; // kolejne co 29 minut (domyślnie)
 const char *NVS_KEY_APRS_INTERVAL_MIN = "aprs_int_min";
 const int DEFAULT_APRS_ALERT_MIN_SEC = 300;
@@ -869,6 +1085,20 @@ const char *NVS_KEY_APRS_ALERT_SCREEN_SEC = "alrt_scr_s";
 const float DEFAULT_APRS_ALERT_DISTANCE_KM = 1.0f;
 const char *NVS_KEY_APRS_ALERT_DISTANCE_KM = "alrt_dst_km";
 const char *NVS_KEY_APRS_ALERT_WX_ENABLED = "alrt_wx_en";
+const char *NVS_KEY_WEATHER_ALERT_STORM_ENABLED = "wx_al_st";
+const char *NVS_KEY_WEATHER_ALERT_WIND_ENABLED = "wx_al_wi";
+const char *NVS_KEY_WEATHER_ALERT_WIND_THRESHOLD_MS = "wx_w_thr";
+const char *NVS_KEY_TFT_NIGHT_DIMMING = "tft_ndim";
+const char *NVS_KEY_USE_GPS_IF_ACTIVE = "gps_auto_pos";
+const bool DEFAULT_WEATHER_ALERT_STORM_ENABLED = false;
+const bool DEFAULT_WEATHER_ALERT_WIND_ENABLED = false;
+const float DEFAULT_WEATHER_ALERT_WIND_THRESHOLD_MS = 12.0f;
+const float WEATHER_ALERT_WIND_THRESHOLD_MIN_MS = 1.0f;
+const float WEATHER_ALERT_WIND_THRESHOLD_MAX_MS = 60.0f;
+const unsigned long WEATHER_ALERT_WIND_REPEAT_MS = 1UL * 60UL * 1000UL;
+const unsigned long WEATHER_ALERT_CURRENT_DATA_MAX_AGE_MS = 30UL * 60UL * 1000UL;
+const bool WEATHER_ALERT_STORM_TEST_MODE = false; // TEMP: wymusza alert burzy co 1 minute
+const bool WEATHER_ALERT_WIND_FORCE_ENABLED = false; // TEMP: wymusza wlaczenie alertu o silnym wietrze
 const bool DEFAULT_ENABLE_LED_ALERT = true;
 const int DEFAULT_LED_ALERT_DURATION_MS = 5000;
 const int DEFAULT_LED_ALERT_BLINK_MS = 500;
@@ -878,10 +1108,15 @@ const char *NVS_KEY_LED_ALERT_BLINK_MS = "led_al_blk";
 unsigned long aprsPositionIntervalMs = (unsigned long)DEFAULT_APRS_INTERVAL_MIN * 60UL * 1000UL;
 unsigned long lastAPRSPositionTxMs = 0;
 unsigned long nextAPRSPositionDueMs = 0;
+unsigned long aprsFilterLastSentMs = 0;
+double aprsFilterLastLat = 0.0;
+double aprsFilterLastLon = 0.0;
+bool aprsFilterLastValid = false;
+bool aprsFilterLastGpsBased = false;
 int aprsIntervalMinutes = DEFAULT_APRS_INTERVAL_MIN;
 const char DEFAULT_APRS_SYMBOL_TABLE = '/';
-const char DEFAULT_APRS_SYMBOL_CODE = '-';
-String aprsSymbolTwoChar = "/-";
+const char DEFAULT_APRS_SYMBOL_CODE = 'V';
+String aprsSymbolTwoChar = "/V";
 char aprsSymbolTable = DEFAULT_APRS_SYMBOL_TABLE;
 char aprsSymbolCode = DEFAULT_APRS_SYMBOL_CODE;
 String aprsUserComment = "";
@@ -892,27 +1127,74 @@ int aprsAlertScreenSeconds = DEFAULT_APRS_ALERT_SCREEN_SEC;
 bool aprsAlertNearbyEnabled = true;
 bool aprsAlertWxEnabled = false;
 float aprsAlertDistanceKm = DEFAULT_APRS_ALERT_DISTANCE_KM;
+bool weatherAlertStormEnabled = DEFAULT_WEATHER_ALERT_STORM_ENABLED;
+bool weatherAlertWindEnabled = DEFAULT_WEATHER_ALERT_WIND_ENABLED;
+float weatherAlertWindThresholdMs = DEFAULT_WEATHER_ALERT_WIND_THRESHOLD_MS;
 bool enableLedAlert = DEFAULT_ENABLE_LED_ALERT;
 int ledAlertDurationMs = DEFAULT_LED_ALERT_DURATION_MS;
 int ledAlertBlinkMs = DEFAULT_LED_ALERT_BLINK_MS;
 int aprsBeaconTxCount = 0;
 const char *APRS_POSITION_COMMENT = "https://github.com/SP3KON/ESP32-HAM-CLOCK";
+const char *APRS_KISS_RF_PATH1 = "WIDE1-1";
+const char *APRS_KISS_RF_PATH2 = "WIDE2-1";
 bool aprsBeaconEnabled = true;
 const unsigned long APRS_ALERT_FRAME_PULSE_MS = 500UL;
+const unsigned long APRS_BEACONING_SCREEN_MS = 2000UL;
 const int APRS_ALERT_CLOSE_BTN_X = 286;
 const int APRS_ALERT_CLOSE_BTN_Y = 7;
 const int APRS_ALERT_CLOSE_BTN_W = 26;
 const int APRS_ALERT_CLOSE_BTN_H = 26;
 const int APRS_ALERT_CLOSE_HIT_W = 50;
 const int APRS_ALERT_CLOSE_HIT_H = 50;
+
+static void applyWeatherAlertWindThresholdMs(float thresholdMs) {
+  float t = thresholdMs;
+  if (t < WEATHER_ALERT_WIND_THRESHOLD_MIN_MS) t = WEATHER_ALERT_WIND_THRESHOLD_MIN_MS;
+  if (t > WEATHER_ALERT_WIND_THRESHOLD_MAX_MS) t = WEATHER_ALERT_WIND_THRESHOLD_MAX_MS;
+  weatherAlertWindThresholdMs = t;
+}
+
+static float weatherAlertWindGustThresholdMs() {
+  return weatherAlertWindThresholdMs + 5.0f;
+}
+
+enum AlertScreenKind {
+  ALERT_SCREEN_NONE = 0,
+  ALERT_SCREEN_APRS = 1,
+  ALERT_SCREEN_WEATHER = 2,
+  ALERT_SCREEN_BEACONING = 3
+};
+
+struct WeatherAlertInfo {
+  bool stormPossible = false;
+  bool stormNow = false;
+  bool windPossible = false;
+  uint8_t stormEtaHours = 0;
+  float maxWindMs = 0.0f;
+  float maxWindGustMs = 0.0f;
+};
+
 bool aprsAlertScreenActive = false;
 unsigned long aprsAlertScreenUntilMs = 0;
 unsigned long aprsAlertFrameLastToggleMs = 0;
 bool aprsAlertFramePulseOn = true;
+AlertScreenKind activeAlertScreenKind = ALERT_SCREEN_NONE;
 APRSStation aprsAlertScreenStation;
 volatile bool aprsAlertDrawPending = false;
 APRSStation aprsAlertPendingStation;
 portMUX_TYPE aprsAlertPendingMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool weatherAlertDrawPending = false;
+WeatherAlertInfo weatherAlertPendingInfo;
+portMUX_TYPE weatherAlertPendingMux = portMUX_INITIALIZER_UNLOCKED;
+WeatherAlertInfo weatherAlertScreenInfo;
+bool weatherStormForecastActive = false;
+bool weatherWindForecastActive = false;
+int weatherStormEtaMinutes = 0;
+unsigned long weatherAlertForecastUpdatedMs = 0;
+float weatherWindForecastMaxMs = 0.0f;
+float weatherWindForecastGustMs = 0.0f;
+unsigned long nextWeatherStormAlertMs = 0;
+unsigned long nextWeatherWindAlertMs = 0;
 
 struct AprsAlertCooldownEntry {
   String callsign;
@@ -951,7 +1233,680 @@ String userLocator = "";
 double userLat = 0.0;
 double userLon = 0.0;
 bool userLatLonValid = false;
-int timezoneHours = DEFAULT_TIMEZONE_HOURS;
+bool useGpsIfActive = false;
+
+// GPS ATGM336H (UART)
+const int GPS_UART_TX_PIN = 22;   // IO22 -> TX ESP32 -> RX GPS
+const int GPS_UART_RX_PIN = 27;   // IO27 -> RX ESP32 <- TX GPS
+const uint32_t GPS_UART_BAUD = 9600;
+const char *GPS_UART_ACTIVATE_COMMAND = "GPS ON";
+const char *UART2_APRS_TNC_KISS_ON_COMMAND = "KISS ON";
+const char *UART2_APRS_TNC_RESTART_COMMAND = "RESTART";
+const char *UART2_BRIDGE_BTSPP_ON_COMMAND = "BTSPP_ON";
+const char *UART2_BRIDGE_BTSPP_OFF_COMMAND = "BTSPP_OFF";
+const char *UART2_BRIDGE_BT_SCAN_COMMAND = "BT SCAN";
+const char *NVS_KEY_UART2_MODE = "uart2_mode";
+const char *NVS_KEY_UART2_CONNECTED_MODULE = "uart2_cmod";
+const char *NVS_KEY_UART2_BAUD = "uart2_baud";
+const char *NVS_KEY_UART2_DATABITS = "uart2_dbits";
+const char *NVS_KEY_UART2_PARITY = "uart2_par";
+const char *NVS_KEY_UART2_STOP_BITS = "uart2_stop";
+const char *NVS_KEY_BRIDGE_PAIR_ADDR = "br_pair_addr";
+const char *NVS_KEY_BRIDGE_PAIR_NAME = "br_pair_name";
+const uint32_t UART2_BAUD_MIN = 300;
+const uint32_t UART2_BAUD_MAX = 2000000;
+const uint8_t DEFAULT_UART2_MODE = 0;      // 0=gps, 1=bt, 2=off
+const uint32_t DEFAULT_UART2_BAUD = GPS_UART_BAUD;
+const uint8_t DEFAULT_UART2_DATA_BITS = 8;
+const uint8_t DEFAULT_UART2_PARITY = 0;    // 0=none, 1=even, 2=odd
+const uint8_t DEFAULT_UART2_STOP_BITS = 1;
+const uint8_t UART2_MODE_GPS = 0;
+const uint8_t UART2_MODE_BT = 1;
+const uint8_t UART2_MODE_OFF = 2;
+const uint8_t UART2_PARITY_NONE = 0;
+const uint8_t UART2_PARITY_EVEN = 1;
+const uint8_t UART2_PARITY_ODD = 2;
+uint8_t uart2Mode = DEFAULT_UART2_MODE;
+String uart2ConnectedModule = "none"; // none, gps, aprs_tnc, aprs_tnc_kiss, esp32_bridge
+uint32_t uart2BaudRate = DEFAULT_UART2_BAUD;
+uint8_t uart2DataBits = DEFAULT_UART2_DATA_BITS;
+uint8_t uart2Parity = DEFAULT_UART2_PARITY;
+uint8_t uart2StopBits = DEFAULT_UART2_STOP_BITS;
+const unsigned long GPS_STATUS_LOG_INTERVAL_MS = 60000UL;
+const unsigned long GPS_FIX_FRESHNESS_MS = 15000UL;
+const unsigned long GPS_UART_ACTIVE_TIMEOUT_MS = 3000UL;
+const unsigned long GPS_RAW_BRIDGE_WINDOW_MS = 60000UL;
+const unsigned long GPS_RAW_STATS_INTERVAL_MS = 5000UL;
+const unsigned long GPS_GSV_SOURCE_FRESHNESS_MS = 10000UL;
+
+static void processAprsFrameFromLine(const String &line, const char *sourceTag);
+bool parseAPRSFrame(String line, APRSStation &station);
+void addAPRSStation(APRSStation station);
+static bool shouldTriggerAprsAlert(const APRSStation &station);
+static bool isLikelyAprsTnc2Frame(const String &line);
+
+const int MAX_BRIDGE_BT_DEVICES = 24;
+const unsigned long BRIDGE_UART_COMMAND_COOLDOWN_MS = 250UL;
+const unsigned long BRIDGE_BTSPP_ON_RETRY_INTERVAL_MS = 2000UL;
+const uint8_t BRIDGE_BTSPP_ON_MAX_TRIES = 3;
+const unsigned long BRIDGE_FORCE_GPS_ON_AFTER_BOOT_MS = 60000UL;
+const unsigned long BRIDGE_FORCE_BTSPP_ON_DELAY_AFTER_GPS_ON_MS = 10000UL;
+const unsigned long APRS_TNC_RESTART_AFTER_BOOT_MS = 30000UL;
+const unsigned long APRS_TNC_KISS_RESTART_DELAY_AFTER_KISS_ON_MS = 1000UL;
+
+struct BridgeBtDevice {
+  String name;
+  String addressNoColon;
+};
+
+HardwareSerial gpsSerial(2);
+String gpsNmeaLine = "";
+double gpsLatitude = 0.0;
+double gpsLongitude = 0.0;
+bool gpsLocationValid = false;
+bool gpsRmcFix = false;
+bool gpsGgaFix = false;
+int gpsSatellitesUsed = -1;
+int gpsSatellitesInView = -1;
+int gpsSatellitesInViewGN = -1;
+int gpsSatellitesInViewGP = -1;
+int gpsSatellitesInViewGL = -1;
+int gpsSatellitesInViewGA = -1;
+int gpsSatellitesInViewGB = -1;
+int gpsSatellitesInViewBD = -1;
+int gpsSatellitesInViewGQ = -1;
+unsigned long gpsSatellitesInViewLastGNMs = 0;
+unsigned long gpsSatellitesInViewLastGPMS = 0;
+unsigned long gpsSatellitesInViewLastGLMs = 0;
+unsigned long gpsSatellitesInViewLastGAMs = 0;
+unsigned long gpsSatellitesInViewLastGBMs = 0;
+unsigned long gpsSatellitesInViewLastBDMs = 0;
+unsigned long gpsSatellitesInViewLastGQMs = 0;
+float gpsSpeedKmh = -1.0f;
+unsigned long gpsLastRmcMs = 0;
+unsigned long gpsLastGgaMs = 0;
+unsigned long gpsLastStatusLogMs = 0;
+unsigned long gpsLastRxMs = 0;
+unsigned long gpsRawBridgeStartMs = 0;
+bool gpsRawBridgeEndLogged = false;
+unsigned long gpsRawLastStatsMs = 0;
+uint32_t gpsRawBytesTotal = 0;
+uint32_t gpsRawBytesSinceStats = 0;
+String gpsUtcTime = "";
+String gpsUtcDate = "";
+String uart2AprsLine = "";
+String uart2YaesuUiAprsPrefix = "";
+bool uart2KissInFrame = false;
+bool uart2KissEscape = false;
+uint8_t uart2KissFrame[600];
+size_t uart2KissFrameLen = 0;
+BridgeBtDevice bridgeBtDevices[MAX_BRIDGE_BT_DEVICES];
+int bridgeBtDeviceCount = 0;
+bool bridgeBtListCollecting = false;
+int bridgeBtListExpected = -1;
+bool bridgeBtScanInProgress = false;
+bool bridgeBtScanRequested = false;
+bool bridgeAwaitBtsppOffAckForScan = false;
+String bridgeBtLastError = "";
+String bridgeBtLastDiscStatus = "";
+String bridgeBtLastAck = "";
+unsigned long bridgeBtLastScanMs = 0;
+unsigned long bridgeBtLastCommandTxMs = 0;
+String bridgeBtPairedAddress = "";
+String bridgeBtPairedName = "";
+bool bridgeBtAutoConnectPending = false;
+bool bridgeBtPairPending = false;
+String bridgeBtPairPendingAddress = "";
+String bridgeBtPairPendingName = "";
+int bridgeBtPairLastResult = 0; // 0=brak, 1=OK, -1=ERR
+unsigned long bridgeBtPairLastResultMs = 0;
+bool bridgeBtsppOnAwaitAck = false;
+uint8_t bridgeBtsppOnRetryCount = 0;
+unsigned long bridgeBtsppOnNextRetryMs = 0;
+bool bridgeBootForceGpsOnSent = false;
+unsigned long bridgeBootForceGpsOnMs = 0;
+bool bridgeBootForceBtsppOnSent = false;
+bool aprsTncBootRestartSent = false;
+bool aprsTncBootKissOnSent = false;
+unsigned long aprsTncBootKissOnSentMs = 0;
+
+static String uart2ModeToCode(uint8_t mode) {
+  if (mode == UART2_MODE_BT) {
+    return "bt";
+  }
+  if (mode == UART2_MODE_OFF) {
+    return "off";
+  }
+  return "gps";
+}
+
+static String sanitizeUart2ConnectedModule(String moduleCode) {
+  moduleCode.trim();
+  moduleCode.toLowerCase();
+
+  if (moduleCode == "gps") {
+    return "gps";
+  }
+  if (moduleCode == "aprs tnc" || moduleCode == "aprs tnc2 (rx only)" || moduleCode == "aprs_tnc" || moduleCode == "tnc") {
+    return "aprs_tnc";
+  }
+  if (moduleCode == "aprs tnc kiss" || moduleCode == "aprs-tnc-kiss" || moduleCode == "aprs_tnc-kiss" ||
+      moduleCode == "aprs_tnc_kiss" || moduleCode == "kiss") {
+    return "aprs_tnc_kiss";
+  }
+  if (moduleCode == "esp32-bridge" || moduleCode == "esp32_bridge" || moduleCode == "bridge") {
+    return "esp32_bridge";
+  }
+  if (moduleCode == "brak" || moduleCode == "none" || moduleCode == "off") {
+    return "none";
+  }
+
+  return "none";
+}
+
+static bool isUart2GpsModuleSelected() {
+  return uart2ConnectedModule == "gps";
+}
+
+static bool isUart2AprsTncModuleSelected() {
+  return uart2ConnectedModule == "aprs_tnc";
+}
+
+static bool isUart2AprsTncKissModuleSelected() {
+  return uart2ConnectedModule == "aprs_tnc_kiss";
+}
+
+static bool isUart2BridgeModuleSelected() {
+  return uart2ConnectedModule == "esp32_bridge";
+}
+
+static bool isLegacyGpsModeWithoutModule() {
+  return (uart2ConnectedModule == "none") && (uart2Mode == UART2_MODE_GPS);
+}
+
+static bool isUart2GpsParsingEnabled() {
+  return isUart2GpsModuleSelected() || isUart2BridgeModuleSelected() || isLegacyGpsModeWithoutModule();
+}
+
+static bool isUart2AprsUartSourceEnabled() {
+  return isUart2AprsTncModuleSelected() || isUart2AprsTncKissModuleSelected() || isUart2BridgeModuleSelected();
+}
+
+static bool isUart2AprsTextParsingEnabled() {
+  if (isUart2AprsTncKissModuleSelected()) {
+    return false;
+  }
+  return isUart2AprsUartSourceEnabled();
+}
+
+static bool isUart2AprsKissParsingEnabled() {
+  return isUart2AprsTncModuleSelected() || isUart2AprsTncKissModuleSelected();
+}
+
+static bool isAprsNetworkFeedEnabled() {
+  return !isUart2AprsUartSourceEnabled();
+}
+
+static String normalizeBridgeBtAddress(String raw) {
+  String cleaned = "";
+  cleaned.reserve(12);
+  for (size_t i = 0; i < raw.length(); i++) {
+    char c = raw.charAt(i);
+    bool isDigitChar = (c >= '0' && c <= '9');
+    bool isUpperHex = (c >= 'A' && c <= 'F');
+    bool isLowerHex = (c >= 'a' && c <= 'f');
+    if (isDigitChar || isUpperHex || isLowerHex) {
+      cleaned += (char)toupper((unsigned char)c);
+      if (cleaned.length() >= 12) {
+        break;
+      }
+    }
+  }
+  if (cleaned.length() != 12) {
+    return "";
+  }
+  return cleaned;
+}
+
+static String formatBridgeBtAddressForDisplay(const String &addrNoColon) {
+  String norm = normalizeBridgeBtAddress(addrNoColon);
+  if (norm.length() != 12) {
+    return "";
+  }
+  String out = "";
+  out.reserve(17);
+  for (int i = 0; i < 12; i += 2) {
+    if (i > 0) out += ":";
+    out += norm.substring(i, i + 2);
+  }
+  return out;
+}
+
+static String sanitizeBridgeTextField(String raw, size_t maxLen) {
+  String out = "";
+  out.reserve(raw.length());
+  for (size_t i = 0; i < raw.length(); i++) {
+    char c = raw.charAt(i);
+    if (c < 32 || c > 126) continue;
+    if (c == '[' || c == ']' || c == '\r' || c == '\n') continue;
+    out += c;
+    if (out.length() >= maxLen) break;
+  }
+  out.trim();
+  return out;
+}
+
+static void clearBridgeBtScanList() {
+  for (int i = 0; i < MAX_BRIDGE_BT_DEVICES; i++) {
+    bridgeBtDevices[i].name = "";
+    bridgeBtDevices[i].addressNoColon = "";
+  }
+  bridgeBtDeviceCount = 0;
+  bridgeBtListExpected = -1;
+  bridgeBtListCollecting = false;
+}
+
+static bool sendBridgeUartCommandLine(const String &command, bool bypassCooldown = false) {
+  if (!isUart2BridgeModuleSelected() || command.length() == 0) {
+    return false;
+  }
+
+  unsigned long nowMs = millis();
+  if (!bypassCooldown && bridgeBtLastCommandTxMs != 0 && (nowMs - bridgeBtLastCommandTxMs) < BRIDGE_UART_COMMAND_COOLDOWN_MS) {
+    return false;
+  }
+
+  gpsSerial.print(command);
+  gpsSerial.print("\r\n");
+  Serial.printf("[BRIDGE] TX: %s\\r\\n\n", command.c_str());
+  bridgeBtLastCommandTxMs = nowMs;
+  return true;
+}
+
+static void saveBridgeBtPairingToNvs() {
+  Preferences bridgePrefs;
+  bridgePrefs.begin("dxcluster", false);
+  bridgePrefs.putString(NVS_KEY_BRIDGE_PAIR_ADDR, bridgeBtPairedAddress);
+  bridgePrefs.putString(NVS_KEY_BRIDGE_PAIR_NAME, bridgeBtPairedName);
+  bridgePrefs.end();
+}
+
+static void resetBridgeBtsppOnRetryState() {
+  bridgeBtsppOnAwaitAck = false;
+  bridgeBtsppOnRetryCount = 0;
+  bridgeBtsppOnNextRetryMs = 0;
+}
+
+static void triggerBridgeBtsppOnRetryStart() {
+  bridgeBtsppOnAwaitAck = true;
+  bridgeBtsppOnRetryCount = 0;
+  bridgeBtsppOnNextRetryMs = 0;
+}
+
+static void serviceBridgeBtsppOnRetry(unsigned long nowMs) {
+  if (!bridgeBtsppOnAwaitAck) {
+    return;
+  }
+
+  if (!isUart2BridgeModuleSelected()) {
+    resetBridgeBtsppOnRetryState();
+    return;
+  }
+
+  if ((long)(nowMs - bridgeBtsppOnNextRetryMs) < 0) {
+    return;
+  }
+
+  if (bridgeBtsppOnRetryCount >= BRIDGE_BTSPP_ON_MAX_TRIES) {
+    bridgeBtsppOnAwaitAck = false;
+    bridgeBtLastError = "BTSPP_ON_NO_ACK";
+    Serial.println("[BRIDGE] Brak ACK BTSPP_ON po 3 probach");
+    return;
+  }
+
+  bool sent = sendBridgeUartCommandLine(UART2_BRIDGE_BTSPP_ON_COMMAND, true);
+  if (sent) {
+    bridgeBtsppOnRetryCount++;
+    Serial.printf("[BRIDGE] BTSPP_ON proba %u/%u\n",
+                  (unsigned)bridgeBtsppOnRetryCount,
+                  (unsigned)BRIDGE_BTSPP_ON_MAX_TRIES);
+  } else {
+    Serial.println("[BRIDGE] BTSPP_ON send fail, ponowie za 2s");
+  }
+
+  bridgeBtsppOnNextRetryMs = nowMs + BRIDGE_BTSPP_ON_RETRY_INTERVAL_MS;
+}
+
+static void serviceBridgeBootForceCommands(unsigned long nowMs) {
+  if (!isUart2BridgeModuleSelected()) {
+    return;
+  }
+
+  // Fallback po starcie: po 60 s wymus GPS ON, niezależnie od statusu connect/autoconnect.
+  if (!bridgeBootForceGpsOnSent && (long)(nowMs - BRIDGE_FORCE_GPS_ON_AFTER_BOOT_MS) >= 0) {
+    if (sendBridgeUartCommandLine(GPS_UART_ACTIVATE_COMMAND, true)) {
+      bridgeBootForceGpsOnSent = true;
+      bridgeBootForceGpsOnMs = nowMs;
+      Serial.println("[BRIDGE] Fallback boot: wysylam GPS ON po 60s");
+    }
+    return;
+  }
+
+  // 10 s po wymuszonym GPS ON wyslij BTSPP_ON bez czekania na odpowiedzi zwrotne.
+  if (bridgeBootForceGpsOnSent && !bridgeBootForceBtsppOnSent &&
+      (long)(nowMs - (bridgeBootForceGpsOnMs + BRIDGE_FORCE_BTSPP_ON_DELAY_AFTER_GPS_ON_MS)) >= 0) {
+    if (sendBridgeUartCommandLine(UART2_BRIDGE_BTSPP_ON_COMMAND, true)) {
+      bridgeBootForceBtsppOnSent = true;
+      Serial.println("[BRIDGE] Fallback boot: wysylam BTSPP_ON po +10s od GPS ON");
+    }
+  }
+}
+
+static void serviceAprsTncBootRestart(unsigned long nowMs) {
+  if (aprsTncBootRestartSent) {
+    return;
+  }
+
+  if (isUart2AprsTncKissModuleSelected()) {
+    // Po 30 s wlacz tryb KISS, a 1 s pozniej zrestartuj modem.
+    if (!aprsTncBootKissOnSent) {
+      if ((long)(nowMs - APRS_TNC_RESTART_AFTER_BOOT_MS) < 0) {
+        return;
+      }
+      gpsSerial.print(UART2_APRS_TNC_KISS_ON_COMMAND);
+      gpsSerial.print("\r\n");
+      Serial.printf("[UART2] TX: %s\\r\\n\n", UART2_APRS_TNC_KISS_ON_COMMAND);
+      aprsTncBootKissOnSent = true;
+      aprsTncBootKissOnSentMs = nowMs;
+      return;
+    }
+
+    if ((long)(nowMs - (aprsTncBootKissOnSentMs + APRS_TNC_KISS_RESTART_DELAY_AFTER_KISS_ON_MS)) < 0) {
+      return;
+    }
+
+    gpsSerial.print(UART2_APRS_TNC_RESTART_COMMAND);
+    gpsSerial.print("\r\n");
+    Serial.printf("[UART2] TX: %s\\r\\n\n", UART2_APRS_TNC_RESTART_COMMAND);
+    aprsTncBootRestartSent = true;
+    return;
+  }
+
+  if (!isUart2AprsTncModuleSelected()) {
+    return;
+  }
+
+  // Po starcie wymusz restart modemu APRS TNC, aby odswiezyc polaczenie BT.
+  if ((long)(nowMs - APRS_TNC_RESTART_AFTER_BOOT_MS) < 0) {
+    return;
+  }
+
+  gpsSerial.print(UART2_APRS_TNC_RESTART_COMMAND);
+  gpsSerial.print("\r\n");
+  Serial.printf("[UART2] TX: %s\\r\\n\n", UART2_APRS_TNC_RESTART_COMMAND);
+  aprsTncBootRestartSent = true;
+}
+
+static void startBridgeScanSequence() {
+  if (!isUart2BridgeModuleSelected()) {
+    return;
+  }
+
+  clearBridgeBtScanList();
+  bridgeBtScanInProgress = true;
+  bridgeBtScanRequested = true;
+  bridgeAwaitBtsppOffAckForScan = true;
+  bridgeBtLastError = "";
+  bridgeBtLastDiscStatus = "";
+  bridgeBtLastAck = "";
+
+  if (!sendBridgeUartCommandLine(UART2_BRIDGE_BTSPP_OFF_COMMAND, true)) {
+    bridgeBtLastError = "SEND_BTSPP_OFF_FAIL";
+    bridgeBtScanInProgress = false;
+    bridgeBtScanRequested = false;
+    bridgeAwaitBtsppOffAckForScan = false;
+  }
+}
+
+static void addOrUpdateBridgeBtDevice(const String &name, const String &addressNoColon) {
+  if (addressNoColon.length() != 12) {
+    return;
+  }
+
+  String safeName = sanitizeBridgeTextField(name, 40);
+  if (safeName.length() == 0) {
+    safeName = "BT_DEVICE";
+  }
+
+  for (int i = 0; i < bridgeBtDeviceCount; i++) {
+    if (bridgeBtDevices[i].addressNoColon.equalsIgnoreCase(addressNoColon)) {
+      bridgeBtDevices[i].name = safeName;
+      return;
+    }
+  }
+
+  if (bridgeBtDeviceCount >= MAX_BRIDGE_BT_DEVICES) {
+    return;
+  }
+
+  bridgeBtDevices[bridgeBtDeviceCount].name = safeName;
+  bridgeBtDevices[bridgeBtDeviceCount].addressNoColon = addressNoColon;
+  bridgeBtDeviceCount++;
+}
+
+static bool requestBridgePairConnect(String nameRaw, String addrRaw, String passwordRaw, bool bypassCooldown = false) {
+  if (!isUart2BridgeModuleSelected()) {
+    return false;
+  }
+
+  String addr = normalizeBridgeBtAddress(addrRaw);
+  if (addr.length() != 12) {
+    bridgeBtLastError = "PAIR_ADDR_INVALID";
+    return false;
+  }
+
+  String safeName = sanitizeBridgeTextField(nameRaw, 40);
+  if (safeName.length() == 0) {
+    safeName = "BT_DEVICE";
+  }
+
+  String safePassword = sanitizeBridgeTextField(passwordRaw, 16);
+  if (safePassword.length() > 16) {
+    bridgeBtLastError = "PAIR_PASSWORD_TOO_LONG";
+    return false;
+  }
+
+  // PIN/hasło jest opcjonalne: nie wymuszaj sztucznego "****", bo to powoduje BTCNT_ERR na części modułów.
+  String command = "BTCNT[NAME]" + safeName + "[ADR]" + addr;
+  if (safePassword.length() > 0) {
+    command += "[PSWD]";
+    command += safePassword;
+  }
+  if (!sendBridgeUartCommandLine(command, bypassCooldown)) {
+    bridgeBtLastError = "PAIR_COMMAND_SEND_FAIL";
+    return false;
+  }
+
+  bridgeBtPairPending = true;
+  bridgeBtPairPendingAddress = addr;
+  bridgeBtPairPendingName = safeName;
+  bridgeBtPairLastResult = 0;
+  return true;
+}
+
+static uint8_t uart2ModeFromCode(String modeCode) {
+  modeCode.trim();
+  modeCode.toLowerCase();
+  if (modeCode == "bt" || modeCode == "bt_module" || modeCode == "bluetooth") {
+    return UART2_MODE_BT;
+  }
+  if (modeCode == "off" || modeCode == "none" || modeCode == "disabled") {
+    return UART2_MODE_OFF;
+  }
+  return UART2_MODE_GPS;
+}
+
+static String uart2ParityToCode(uint8_t parity) {
+  if (parity == UART2_PARITY_EVEN) {
+    return "even";
+  }
+  if (parity == UART2_PARITY_ODD) {
+    return "odd";
+  }
+  return "none";
+}
+
+static uint8_t uart2ParityFromCode(String parityCode) {
+  parityCode.trim();
+  parityCode.toLowerCase();
+  if (parityCode == "even" || parityCode == "e") {
+    return UART2_PARITY_EVEN;
+  }
+  if (parityCode == "odd" || parityCode == "o") {
+    return UART2_PARITY_ODD;
+  }
+  return UART2_PARITY_NONE;
+}
+
+static void applyUart2BaudRate(int candidateBaud) {
+  long bounded = candidateBaud;
+  if (bounded < (long)UART2_BAUD_MIN) bounded = (long)UART2_BAUD_MIN;
+  if (bounded > (long)UART2_BAUD_MAX) bounded = (long)UART2_BAUD_MAX;
+  uart2BaudRate = (uint32_t)bounded;
+}
+
+static void applyUart2DataBits(int candidateDataBits) {
+  uart2DataBits = (candidateDataBits == 7) ? 7 : 8;
+}
+
+static void applyUart2StopBits(int candidateStopBits) {
+  uart2StopBits = (candidateStopBits == 2) ? 2 : 1;
+}
+
+static uint32_t getUart2SerialConfig() {
+  if (uart2DataBits == 7) {
+    if (uart2Parity == UART2_PARITY_EVEN) {
+      return (uart2StopBits == 2) ? SERIAL_7E2 : SERIAL_7E1;
+    }
+    if (uart2Parity == UART2_PARITY_ODD) {
+      return (uart2StopBits == 2) ? SERIAL_7O2 : SERIAL_7O1;
+    }
+    return (uart2StopBits == 2) ? SERIAL_7N2 : SERIAL_7N1;
+  }
+
+  if (uart2Parity == UART2_PARITY_EVEN) {
+    return (uart2StopBits == 2) ? SERIAL_8E2 : SERIAL_8E1;
+  }
+  if (uart2Parity == UART2_PARITY_ODD) {
+    return (uart2StopBits == 2) ? SERIAL_8O2 : SERIAL_8O1;
+  }
+  return (uart2StopBits == 2) ? SERIAL_8N2 : SERIAL_8N1;
+}
+
+static void resetGpsRuntimeState() {
+  gpsNmeaLine = "";
+  gpsLatitude = 0.0;
+  gpsLongitude = 0.0;
+  gpsLocationValid = false;
+  gpsRmcFix = false;
+  gpsGgaFix = false;
+  gpsSatellitesUsed = -1;
+  gpsSatellitesInView = -1;
+  gpsSatellitesInViewGN = -1;
+  gpsSatellitesInViewGP = -1;
+  gpsSatellitesInViewGL = -1;
+  gpsSatellitesInViewGA = -1;
+  gpsSatellitesInViewGB = -1;
+  gpsSatellitesInViewBD = -1;
+  gpsSatellitesInViewGQ = -1;
+  gpsSatellitesInViewLastGNMs = 0;
+  gpsSatellitesInViewLastGPMS = 0;
+  gpsSatellitesInViewLastGLMs = 0;
+  gpsSatellitesInViewLastGAMs = 0;
+  gpsSatellitesInViewLastGBMs = 0;
+  gpsSatellitesInViewLastBDMs = 0;
+  gpsSatellitesInViewLastGQMs = 0;
+  gpsSpeedKmh = -1.0f;
+  gpsLastRmcMs = 0;
+  gpsLastGgaMs = 0;
+  gpsLastStatusLogMs = 0;
+  gpsLastRxMs = 0;
+  gpsRawBridgeStartMs = millis();
+  gpsRawBridgeEndLogged = false;
+  gpsRawLastStatsMs = gpsRawBridgeStartMs;
+  gpsRawBytesTotal = 0;
+  gpsRawBytesSinceStats = 0;
+  gpsUtcTime = "";
+  gpsUtcDate = "";
+  uart2AprsLine = "";
+  uart2YaesuUiAprsPrefix = "";
+  uart2KissInFrame = false;
+  uart2KissEscape = false;
+  uart2KissFrameLen = 0;
+}
+
+static void configureUart2Port() {
+  gpsSerial.end();
+  resetGpsRuntimeState();
+  resetBridgeBtsppOnRetryState();
+  aprsTncBootRestartSent = false;
+  aprsTncBootKissOnSent = false;
+  aprsTncBootKissOnSentMs = 0;
+  bridgeBtScanInProgress = false;
+  bridgeBtScanRequested = false;
+  bridgeAwaitBtsppOffAckForScan = false;
+
+  uint32_t serialCfg = getUart2SerialConfig();
+  gpsSerial.begin(uart2BaudRate, serialCfg, GPS_UART_RX_PIN, GPS_UART_TX_PIN);
+
+  char parityChar = 'N';
+  if (uart2Parity == UART2_PARITY_EVEN) parityChar = 'E';
+  if (uart2Parity == UART2_PARITY_ODD) parityChar = 'O';
+  Serial.printf("[UART2] Start RX=IO%d TX=IO%d BAUD=%lu FORMAT=%u%c%u TRYB=%s\n",
+                GPS_UART_RX_PIN,
+                GPS_UART_TX_PIN,
+                (unsigned long)uart2BaudRate,
+                (unsigned)uart2DataBits,
+                parityChar,
+                (unsigned)uart2StopBits,
+                uart2ModeToCode(uart2Mode).c_str());
+
+  if (isUart2GpsParsingEnabled()) {
+    // Aktywacja GPS. Dla ATGM336H komenda jest po prostu ignorowana.
+    gpsSerial.print(GPS_UART_ACTIVATE_COMMAND);
+    gpsSerial.print("\r\n");
+    Serial.printf("[UART2] TX: %s\\r\\n\n", GPS_UART_ACTIVATE_COMMAND);
+
+    // Nie uruchamiaj automatycznie skanu BT na starcie.
+    // Skan BTSPP ma byc wykonywany tylko recznie z panelu WWW.
+    gpsSerial.print(UART2_BRIDGE_BTSPP_OFF_COMMAND);
+    gpsSerial.print("\r\n");
+    Serial.printf("[UART2] TX: %s\\r\\n\n", UART2_BRIDGE_BTSPP_OFF_COMMAND);
+
+    gpsRawBridgeStartMs = millis();
+    gpsRawLastStatsMs = gpsRawBridgeStartMs;
+    gpsRawBridgeEndLogged = false;
+    Serial.println("[GPS RAW] Start trybu testowego: przez 60 s surowe bajty z GPS beda kopiowane 1:1 na USB Serial");
+#ifdef ENABLE_TFT_DISPLAY
+    if (TOUCH_MISO == GPS_UART_RX_PIN) {
+      Serial.printf("[GPS WARN] MOZLIWY KONFLIKT PINOW: GPS RX=IO%d i TOUCH_MISO=IO%d\n", GPS_UART_RX_PIN, TOUCH_MISO);
+    }
+#endif
+  } else {
+    // Gdy GPS parser nie jest aktywny, most BT SPP ma byc wyłączony.
+    gpsSerial.print(UART2_BRIDGE_BTSPP_OFF_COMMAND);
+    gpsSerial.print("\r\n");
+    Serial.printf("[UART2] TX: %s\\r\\n\n", UART2_BRIDGE_BTSPP_OFF_COMMAND);
+    gpsRawBridgeEndLogged = true;
+    if (isUart2AprsUartSourceEnabled()) {
+      Serial.println("[UART2] Nasluch APRS/TNC aktywny (parser GPS wylaczony)");
+    } else {
+      Serial.println("[UART2] Tryb none: dane z UART2 beda ignorowane");
+    }
+  }
+}
+
+float timezoneHours = DEFAULT_TIMEZONE_HOURS;
 String qrzUsername = "";
 String qrzPassword = "";
 String qrzStatus = "QRZ: not configured";
@@ -962,16 +1917,26 @@ String openWebRxUrl = DEFAULT_OPENWEBRX_URL;
 bool clusterNoAnnouncements = true;      // set/noann - wyłącz ogłoszenia
 bool clusterNoWWV = true;                // set/nowwv - wyłącz WWV
 bool clusterNoWCY = true;                // set/nowcy - wyłącz WCY
-bool clusterUseFilters = false;           // Czy używać filtrów (set/filter)
-String clusterFilterCommands = "";        // Dodatkowe komendy filtrĂłw (np. "set/filter k,ve/pass")
+bool clusterUseFilters = true;            // Czy używać filtrów (set/filter)
+String clusterFilterCommands = "set/ft8"; // Domyślna komenda filtra dla nowej konfiguracji
+// Preferences/NVS key max length on ESP32 is 15 chars.
+const char* NVS_KEY_CLUSTER_USEFILTERS = "cluster_usefl";
 
 // Status poĹ‚Ä…czenia
 bool wifiConnected = false;
+unsigned long wifiConnectedAtMs = 0;
 bool telnetConnected = false;
 unsigned long lastTelnetAttempt = 0;
 unsigned long lastNTPUpdate = 0;
+bool gpsTimeSourceWasActive = false;
 unsigned long lastWiFiReconnectAttempt = 0;
+unsigned long lastWiFiStaReconnectAttempt = 0;
+unsigned long wifiStaRetryWindowStartMs = 0;
 unsigned long lastPotaAttempt = 0;
+const unsigned long WIFI_AP_RETRY_INTERVAL_MS = 5UL * 60UL * 1000UL; // 5 minut
+const unsigned long WIFI_STA_RETRY_INTERVAL_MS = 20UL * 1000UL; // 20 sekund
+const unsigned long WIFI_STA_RETRY_WINDOW_MS = 10UL * 60UL * 1000UL; // maks. 10 minut prób w STA
+const uint8_t WIFI_STA_RECONNECT_ATTEMPTS = 6; // 6 * 500ms = ~3s na SSID (mniej blokujące)
 
 const uint8_t RGB_LED_RED_PIN = 4;
 const uint8_t RGB_LED_GREEN_PIN = 16;
@@ -1029,6 +1994,1273 @@ struct QrzCacheEntry {
 const int QRZ_CACHE_SIZE = 20;
 QrzCacheEntry qrzCache[QRZ_CACHE_SIZE];
 
+static bool validateNmeaChecksum(const String &line) {
+  if (!line.startsWith("$")) {
+    return false;
+  }
+
+  int starPos = line.indexOf('*');
+  if (starPos < 0) {
+    return true;
+  }
+  if ((starPos + 2) >= (int)line.length()) {
+    return false;
+  }
+
+  uint8_t calc = 0;
+  for (int i = 1; i < starPos; i++) {
+    calc ^= (uint8_t)line.charAt(i);
+  }
+
+  char expectedHex[3];
+  expectedHex[0] = line.charAt(starPos + 1);
+  expectedHex[1] = line.charAt(starPos + 2);
+  expectedHex[2] = '\0';
+  uint8_t expected = (uint8_t)strtoul(expectedHex, nullptr, 16);
+
+  return calc == expected;
+}
+
+static String getNmeaField(const String &line, int fieldIndex) {
+  int fieldStart = 0;
+  int currentField = 0;
+
+  for (int i = 0; i <= (int)line.length(); i++) {
+    bool fieldEnd = (i == (int)line.length()) || (line.charAt(i) == ',') || (line.charAt(i) == '*');
+    if (!fieldEnd) {
+      continue;
+    }
+
+    if (currentField == fieldIndex) {
+      return line.substring(fieldStart, i);
+    }
+
+    currentField++;
+    fieldStart = i + 1;
+
+    if (i < (int)line.length() && line.charAt(i) == '*') {
+      break;
+    }
+  }
+
+  return "";
+}
+
+static bool parseNmeaCoordinate(const String &rawCoord, char hemisphere, double &outCoord) {
+  if (rawCoord.length() < 4) {
+    return false;
+  }
+
+  int dotPos = rawCoord.indexOf('.');
+  int degDigits = (dotPos > 4) ? 3 : 2;
+  if (dotPos < 0) {
+    degDigits = (rawCoord.length() > 5) ? 3 : 2;
+  }
+  if ((int)rawCoord.length() <= degDigits) {
+    return false;
+  }
+
+  double degrees = rawCoord.substring(0, degDigits).toDouble();
+  double minutes = rawCoord.substring(degDigits).toDouble();
+  if (minutes < 0.0 || minutes >= 60.0) {
+    return false;
+  }
+
+  outCoord = degrees + (minutes / 60.0);
+  hemisphere = (char)toupper((unsigned char)hemisphere);
+  if (hemisphere == 'S' || hemisphere == 'W') {
+    outCoord = -outCoord;
+  }
+
+  return true;
+}
+
+static void updateGpsFromRmc(const String &line) {
+  String status = getNmeaField(line, 2);
+  status.toUpperCase();
+
+  gpsRmcFix = (status.length() > 0 && status.charAt(0) == 'A');
+  gpsLastRmcMs = millis();
+
+  String utc = getNmeaField(line, 1);
+  if (utc.length() >= 6) {
+    gpsUtcTime = utc.substring(0, 6);
+  }
+
+  String date = getNmeaField(line, 9);
+  if (date.length() >= 6) {
+    gpsUtcDate = date.substring(0, 6);
+  }
+
+  String speedKnotsField = getNmeaField(line, 7);
+  if (speedKnotsField.length() > 0) {
+    gpsSpeedKmh = speedKnotsField.toFloat() * 1.852f;
+  } else {
+    gpsSpeedKmh = -1.0f;
+  }
+
+  if (!gpsRmcFix) {
+    return;
+  }
+
+  String latField = getNmeaField(line, 3);
+  String latHemField = getNmeaField(line, 4);
+  String lonField = getNmeaField(line, 5);
+  String lonHemField = getNmeaField(line, 6);
+
+  if (latField.length() == 0 || latHemField.length() == 0 || lonField.length() == 0 || lonHemField.length() == 0) {
+    return;
+  }
+
+  double parsedLat = 0.0;
+  double parsedLon = 0.0;
+  if (!parseNmeaCoordinate(latField, latHemField.charAt(0), parsedLat)) {
+    return;
+  }
+  if (!parseNmeaCoordinate(lonField, lonHemField.charAt(0), parsedLon)) {
+    return;
+  }
+
+  gpsLatitude = parsedLat;
+  gpsLongitude = parsedLon;
+  gpsLocationValid = true;
+}
+
+static void updateGpsFromGga(const String &line) {
+  String fixQualityField = getNmeaField(line, 6);
+  int fixQuality = fixQualityField.toInt();
+  String satsUsedField = getNmeaField(line, 7);
+  if (satsUsedField.length() > 0) {
+    gpsSatellitesUsed = satsUsedField.toInt();
+  }
+
+  gpsGgaFix = (fixQuality > 0);
+  gpsLastGgaMs = millis();
+
+  String utc = getNmeaField(line, 1);
+  if (utc.length() >= 6) {
+    gpsUtcTime = utc.substring(0, 6);
+  }
+
+  if (!gpsGgaFix) {
+    return;
+  }
+
+  String latField = getNmeaField(line, 2);
+  String latHemField = getNmeaField(line, 3);
+  String lonField = getNmeaField(line, 4);
+  String lonHemField = getNmeaField(line, 5);
+
+  if (latField.length() == 0 || latHemField.length() == 0 || lonField.length() == 0 || lonHemField.length() == 0) {
+    return;
+  }
+
+  double parsedLat = 0.0;
+  double parsedLon = 0.0;
+  if (!parseNmeaCoordinate(latField, latHemField.charAt(0), parsedLat)) {
+    return;
+  }
+  if (!parseNmeaCoordinate(lonField, lonHemField.charAt(0), parsedLon)) {
+    return;
+  }
+
+  gpsLatitude = parsedLat;
+  gpsLongitude = parsedLon;
+  gpsLocationValid = true;
+}
+
+static void updateGpsFromGsv(const String &line) {
+  String sentenceType = getNmeaField(line, 0);
+  if (sentenceType.startsWith("$")) {
+    sentenceType.remove(0, 1);
+  }
+  sentenceType.toUpperCase();
+
+  String talker = "";
+  if (sentenceType.length() >= 2) {
+    talker = sentenceType.substring(0, 2);
+  }
+
+  String satsInViewField = getNmeaField(line, 3);
+  if (satsInViewField.length() == 0) {
+    return;
+  }
+
+  int satsInView = satsInViewField.toInt();
+  if (satsInView < 0) {
+    return;
+  }
+
+  unsigned long nowMs = millis();
+
+  if (talker == "GN") {
+    gpsSatellitesInViewGN = satsInView;
+    gpsSatellitesInViewLastGNMs = nowMs;
+  } else if (talker == "GP") {
+    gpsSatellitesInViewGP = satsInView;
+    gpsSatellitesInViewLastGPMS = nowMs;
+  } else if (talker == "GL") {
+    gpsSatellitesInViewGL = satsInView;
+    gpsSatellitesInViewLastGLMs = nowMs;
+  } else if (talker == "GA") {
+    gpsSatellitesInViewGA = satsInView;
+    gpsSatellitesInViewLastGAMs = nowMs;
+  } else if (talker == "GB" || talker == "BD") {
+    if (talker == "GB") {
+      gpsSatellitesInViewGB = satsInView;
+      gpsSatellitesInViewLastGBMs = nowMs;
+    } else {
+      gpsSatellitesInViewBD = satsInView;
+      gpsSatellitesInViewLastBDMs = nowMs;
+    }
+  } else if (talker == "GQ") {
+    gpsSatellitesInViewGQ = satsInView;
+    gpsSatellitesInViewLastGQMs = nowMs;
+  }
+
+  bool gnFresh = (gpsSatellitesInViewGN >= 0) && (gpsSatellitesInViewLastGNMs != 0) && ((nowMs - gpsSatellitesInViewLastGNMs) <= GPS_GSV_SOURCE_FRESHNESS_MS);
+  if (gnFresh) {
+    // GNGSV zwykle podaje laczna liczbe satelitow we wszystkich konstelacjach.
+    gpsSatellitesInView = gpsSatellitesInViewGN;
+    return;
+  }
+
+  int totalInView = 0;
+  bool hasAny = false;
+
+  if (gpsSatellitesInViewGP >= 0 && gpsSatellitesInViewLastGPMS != 0 && (nowMs - gpsSatellitesInViewLastGPMS) <= GPS_GSV_SOURCE_FRESHNESS_MS) {
+    totalInView += gpsSatellitesInViewGP;
+    hasAny = true;
+  }
+  if (gpsSatellitesInViewGL >= 0 && gpsSatellitesInViewLastGLMs != 0 && (nowMs - gpsSatellitesInViewLastGLMs) <= GPS_GSV_SOURCE_FRESHNESS_MS) {
+    totalInView += gpsSatellitesInViewGL;
+    hasAny = true;
+  }
+  if (gpsSatellitesInViewGA >= 0 && gpsSatellitesInViewLastGAMs != 0 && (nowMs - gpsSatellitesInViewLastGAMs) <= GPS_GSV_SOURCE_FRESHNESS_MS) {
+    totalInView += gpsSatellitesInViewGA;
+    hasAny = true;
+  }
+  if (gpsSatellitesInViewGB >= 0 && gpsSatellitesInViewLastGBMs != 0 && (nowMs - gpsSatellitesInViewLastGBMs) <= GPS_GSV_SOURCE_FRESHNESS_MS) {
+    totalInView += gpsSatellitesInViewGB;
+    hasAny = true;
+  }
+  if (gpsSatellitesInViewBD >= 0 && gpsSatellitesInViewLastBDMs != 0 && (nowMs - gpsSatellitesInViewLastBDMs) <= GPS_GSV_SOURCE_FRESHNESS_MS) {
+    totalInView += gpsSatellitesInViewBD;
+    hasAny = true;
+  }
+  if (gpsSatellitesInViewGQ >= 0 && gpsSatellitesInViewLastGQMs != 0 && (nowMs - gpsSatellitesInViewLastGQMs) <= GPS_GSV_SOURCE_FRESHNESS_MS) {
+    totalInView += gpsSatellitesInViewGQ;
+    hasAny = true;
+  }
+
+  if (hasAny) {
+    gpsSatellitesInView = totalInView;
+  } else {
+    gpsSatellitesInView = satsInView;
+  }
+}
+
+static bool parseGpsEsp32Frame(const String &line) {
+  if (!line.startsWith("$GPSESP32[")) {
+    return false;
+  }
+
+  int openPos = line.indexOf('[');
+  int closePos = line.lastIndexOf(']');
+  if (openPos < 0 || closePos <= openPos) {
+    return true;
+  }
+
+  String payload = line.substring(openPos + 1, closePos);
+  String fields[7];
+  int fieldCount = 0;
+  int start = 0;
+  for (int i = 0; i <= (int)payload.length(); i++) {
+    bool endField = (i == (int)payload.length()) || (payload.charAt(i) == ',');
+    if (!endField) {
+      continue;
+    }
+
+    if (fieldCount >= 7) {
+      return true;
+    }
+
+    fields[fieldCount] = payload.substring(start, i);
+    fields[fieldCount].trim();
+    fieldCount++;
+    start = i + 1;
+  }
+
+  if (fieldCount != 7) {
+    return true;
+  }
+
+  bool nmeaValid = (fields[0].toInt() == 1);
+  bool hasFix = (fields[1].toInt() == 1);
+  int sats = fields[2].toInt();
+  if (sats < 0) sats = 0;
+  if (sats > 99) sats = 99;
+
+  String hhmmss = "";
+  if (fields[5].length() == 8 && fields[5].charAt(2) == ':' && fields[5].charAt(5) == ':') {
+    hhmmss = fields[5].substring(0, 2) + fields[5].substring(3, 5) + fields[5].substring(6, 8);
+  }
+
+  String ddmmyy = "";
+  if (fields[6].length() == 10 && fields[6].charAt(2) == '-' && fields[6].charAt(5) == '-') {
+    ddmmyy = fields[6].substring(0, 2) + fields[6].substring(3, 5) + fields[6].substring(8, 10);
+  }
+
+  unsigned long nowMs = millis();
+  gpsLastRmcMs = nowMs;
+  gpsLastGgaMs = nowMs;
+  gpsRmcFix = nmeaValid && hasFix;
+  gpsGgaFix = nmeaValid && hasFix;
+  gpsSatellitesUsed = sats;
+  gpsSatellitesInView = sats;
+  gpsSatellitesInViewGN = -1;
+  gpsSatellitesInViewGP = -1;
+  gpsSatellitesInViewGL = -1;
+  gpsSatellitesInViewGA = -1;
+  gpsSatellitesInViewGB = -1;
+  gpsSatellitesInViewBD = -1;
+  gpsSatellitesInViewGQ = -1;
+  gpsSatellitesInViewLastGNMs = 0;
+  gpsSatellitesInViewLastGPMS = 0;
+  gpsSatellitesInViewLastGLMs = 0;
+  gpsSatellitesInViewLastGAMs = 0;
+  gpsSatellitesInViewLastGBMs = 0;
+  gpsSatellitesInViewLastBDMs = 0;
+  gpsSatellitesInViewLastGQMs = 0;
+  gpsSpeedKmh = -1.0f;
+  gpsUtcTime = hhmmss;
+  gpsUtcDate = ddmmyy;
+
+  if (!(nmeaValid && hasFix)) {
+    gpsLocationValid = false;
+    gpsLatitude = 0.0;
+    gpsLongitude = 0.0;
+    return true;
+  }
+
+  double lat = fields[3].toDouble();
+  double lon = fields[4].toDouble();
+  bool latOk = (lat >= -90.0 && lat <= 90.0);
+  bool lonOk = (lon >= -180.0 && lon <= 180.0);
+  if (latOk && lonOk) {
+    gpsLatitude = lat;
+    gpsLongitude = lon;
+    gpsLocationValid = true;
+  } else {
+    gpsLocationValid = false;
+  }
+
+  return true;
+}
+
+static void parseGpsNmeaSentence(const String &line) {
+  if (parseGpsEsp32Frame(line)) {
+    return;
+  }
+
+  if (!validateNmeaChecksum(line)) {
+    return;
+  }
+
+  String sentenceType = getNmeaField(line, 0);
+  if (sentenceType.startsWith("$")) {
+    sentenceType.remove(0, 1);
+  }
+  sentenceType.toUpperCase();
+
+  if (sentenceType.endsWith("RMC")) {
+    updateGpsFromRmc(line);
+    return;
+  }
+
+  if (sentenceType.endsWith("GGA")) {
+    updateGpsFromGga(line);
+    return;
+  }
+
+  if (sentenceType.endsWith("GSV")) {
+    updateGpsFromGsv(line);
+    return;
+  }
+}
+
+static String decodeKissPrintableInfo(const uint8_t *payload, size_t len, size_t infoStart) {
+  if (len == 0 || infoStart >= len) {
+    return "";
+  }
+
+  String out = "";
+  out.reserve((len - infoStart) + 8);
+  for (size_t i = infoStart; i < len; i++) {
+    char c = (char)payload[i];
+    if (c == '\r' || c == '\n') {
+      continue;
+    }
+    if ((uint8_t)c < 32 || (uint8_t)c > 126) {
+      if (c == '\t') {
+        out += ' ';
+      }
+      continue;
+    }
+    out += c;
+  }
+  out.trim();
+  return out;
+}
+
+static String decodeAx25AddressToken(const uint8_t *addr, bool withRepeatedMark, bool *okOut, bool *lastOut = nullptr) {
+  bool ok = true;
+  String call = "";
+  call.reserve(6);
+
+  for (int i = 0; i < 6; i++) {
+    char c = (char)(addr[i] >> 1);
+    if (c == ' ') {
+      continue;
+    }
+    if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
+      ok = false;
+      break;
+    }
+    call += c;
+  }
+
+  call.trim();
+  if (call.length() == 0) {
+    ok = false;
+  }
+
+  if (!ok) {
+    if (okOut) *okOut = false;
+    if (lastOut) *lastOut = false;
+    return "";
+  }
+
+  uint8_t ssid = (uint8_t)((addr[6] >> 1) & 0x0F);
+  bool isLast = (addr[6] & 0x01) != 0;
+  bool hasBeenRepeated = (addr[6] & 0x80) != 0;
+
+  String token = call;
+  if (ssid > 0) {
+    token += "-";
+    token += String(ssid);
+  }
+  if (withRepeatedMark && hasBeenRepeated) {
+    token += "*";
+  }
+
+  if (okOut) *okOut = true;
+  if (lastOut) *lastOut = isLast;
+  return token;
+}
+
+static String decodeKissPayloadToTnc2(const uint8_t *payload, size_t len) {
+  if (len == 0) {
+    return "";
+  }
+
+  // Fallback: część modemów zwraca już payload tekstowy.
+  if (len < 16) {
+    return decodeKissPrintableInfo(payload, len, 0);
+  }
+
+  size_t offset = 0;
+  bool ok = false;
+  bool isLast = false;
+
+  String destination = decodeAx25AddressToken(payload + offset, false, &ok, &isLast);
+  if (!ok) {
+    return decodeKissPrintableInfo(payload, len, 0);
+  }
+  offset += 7;
+
+  if ((offset + 7) > len) {
+    return decodeKissPrintableInfo(payload, len, 0);
+  }
+
+  String source = decodeAx25AddressToken(payload + offset, false, &ok, &isLast);
+  if (!ok) {
+    return decodeKissPrintableInfo(payload, len, 0);
+  }
+  offset += 7;
+
+  String path = "";
+  uint8_t digiGuard = 0;
+  while (!isLast && (offset + 7) <= len && digiGuard < 8) {
+    bool digiLast = false;
+    String digi = decodeAx25AddressToken(payload + offset, true, &ok, &digiLast);
+    if (!ok || digi.length() == 0) {
+      return decodeKissPrintableInfo(payload, len, 0);
+    }
+    if (path.length() > 0) {
+      path += ",";
+    }
+    path += digi;
+    isLast = digiLast;
+    offset += 7;
+    digiGuard++;
+  }
+
+  if (!isLast || offset >= len) {
+    return decodeKissPrintableInfo(payload, len, 0);
+  }
+
+  size_t infoStart = offset;
+  if (infoStart < len && payload[infoStart] == 0x03) {
+    infoStart++;
+  }
+  if (infoStart < len && payload[infoStart] == 0xF0) {
+    infoStart++;
+  }
+
+  String info = decodeKissPrintableInfo(payload, len, infoStart);
+  if (info.length() == 0) {
+    return "";
+  }
+
+  String tnc2 = source;
+  tnc2 += ">";
+  tnc2 += destination;
+  if (path.length() > 0) {
+    tnc2 += ",";
+    tnc2 += path;
+  }
+  tnc2 += ":";
+  tnc2 += info;
+  return tnc2;
+}
+
+static bool isAprsCallsignTokenValid(const String &token) {
+  if (token.length() < 3 || token.length() > 15) {
+    return false;
+  }
+
+  for (size_t i = 0; i < token.length(); i++) {
+    char c = token.charAt(i);
+    bool ok = ((c >= 'A' && c <= 'Z') ||
+               (c >= 'a' && c <= 'z') ||
+               (c >= '0' && c <= '9') ||
+               c == '-');
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool isAprsSourceChar(char c) {
+  return ((c >= 'A' && c <= 'Z') ||
+          (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') ||
+          c == '-');
+}
+
+static int findAprsFrameStartInText(const String &text, int fromPos) {
+  int gtPos = text.indexOf('>', fromPos);
+  while (gtPos >= 0) {
+    int start = gtPos - 1;
+    while (start >= 0 && isAprsSourceChar(text.charAt(start))) {
+      start--;
+    }
+    start++;
+
+    int tokenLen = gtPos - start;
+    if (tokenLen >= 3 && tokenLen <= 15) {
+      String src = text.substring(start, gtPos);
+      if (isAprsCallsignTokenValid(src)) {
+        return start;
+      }
+    }
+
+    gtPos = text.indexOf('>', gtPos + 1);
+  }
+
+  return -1;
+}
+
+static void stripKnownUartNoiseTokens(String &line) {
+  // BT stack alert, który bywa doklejany do ramek APRS bez separatora.
+  const char *warnToken = "ASSERT_WARN(1 8), in lc_task.c at line 1559";
+  while (line.indexOf(warnToken) >= 0) {
+    line.replace(warnToken, "");
+  }
+}
+
+static void removeAllTokenFromLine(String &line, const char *token) {
+  while (line.indexOf(token) >= 0) {
+    line.replace(token, "");
+  }
+}
+
+static void stripBridgeControlTokensFromLine(String &line) {
+  removeAllTokenFromLine(line, "ACK BTSPP_OFF");
+  removeAllTokenFromLine(line, "ACK BTSPP_ON");
+  removeAllTokenFromLine(line, "ACK BT SCAN");
+  removeAllTokenFromLine(line, "[BT] AUTO CONNECT OK");
+  removeAllTokenFromLine(line, "AUTO CONNECT OK");
+  removeAllTokenFromLine(line, "BTCNT_OK");
+  removeAllTokenFromLine(line, "BTCNT_ERR");
+  removeAllTokenFromLine(line, "BTDISC_OK");
+  removeAllTokenFromLine(line, "BTDISC_ERR");
+  removeAllTokenFromLine(line, "BT[LIST_END]");
+
+  int beginPos = line.indexOf("BT[LIST_BEGIN]:");
+  while (beginPos >= 0) {
+    int endPos = beginPos + (int)strlen("BT[LIST_BEGIN]:");
+    while (endPos < (int)line.length() && isdigit((unsigned char)line.charAt(endPos))) {
+      endPos++;
+    }
+    line.remove(beginPos, endPos - beginPos);
+    beginPos = line.indexOf("BT[LIST_BEGIN]:");
+  }
+
+  int namePos = line.indexOf("BT[NAME]:");
+  while (namePos >= 0) {
+    int btPos = line.indexOf("[BT]", namePos + 9);
+    if (btPos >= 0) {
+      line.remove(namePos, (btPos + 4) - namePos);
+    } else {
+      line.remove(namePos);
+      break;
+    }
+    namePos = line.indexOf("BT[NAME]:");
+  }
+
+  int errPos = line.indexOf("BT[ERROR]:");
+  while (errPos >= 0) {
+    int btPos = line.indexOf("[BT]", errPos + 10);
+    if (btPos >= 0) {
+      line.remove(errPos, (btPos + 4) - errPos);
+    } else {
+      line.remove(errPos);
+      break;
+    }
+    errPos = line.indexOf("BT[ERROR]:");
+  }
+}
+
+static bool parseBridgeBtNameLine(const String &line, String &outName, String &outAddrNoColon) {
+  int namePos = line.indexOf("BT[NAME]:");
+  if (namePos < 0) {
+    return false;
+  }
+
+  String payload = line.substring(namePos + 9);
+  int adrPos = payload.indexOf("[ADR]");
+  int btPos = payload.indexOf("[BT]", adrPos + 5);
+  if (adrPos < 0 || btPos < 0 || btPos <= adrPos) {
+    return false;
+  }
+
+  String name = payload.substring(0, adrPos);
+  String rawAddr = payload.substring(adrPos + 5, btPos);
+  name = sanitizeBridgeTextField(name, 40);
+  String normAddr = normalizeBridgeBtAddress(rawAddr);
+  if (normAddr.length() != 12) {
+    return false;
+  }
+  if (name.length() == 0) {
+    name = "BT_DEVICE";
+  }
+
+  outName = name;
+  outAddrNoColon = normAddr;
+  return true;
+}
+
+static bool processBridgeControlLine(String rawLine) {
+  if (!isUart2BridgeModuleSelected()) {
+    return false;
+  }
+
+  String line = rawLine;
+  line.trim();
+  if (line.length() == 0) {
+    return false;
+  }
+
+  bool handled = false;
+
+  if (line.indexOf("ACK BTSPP_OFF") >= 0) {
+    bridgeBtLastAck = "ACK BTSPP_OFF";
+    handled = true;
+    if (bridgeAwaitBtsppOffAckForScan || bridgeBtScanRequested) {
+      bridgeAwaitBtsppOffAckForScan = false;
+      bridgeBtScanRequested = false;
+      if (!sendBridgeUartCommandLine(UART2_BRIDGE_BT_SCAN_COMMAND, true)) {
+        bridgeBtLastError = "SEND_BT_SCAN_FAIL";
+        bridgeBtScanInProgress = false;
+      }
+    }
+  }
+
+  if (line.indexOf("ACK BTSPP_ON") >= 0) {
+    bridgeBtLastAck = "ACK BTSPP_ON";
+    bridgeBtLastError = "";
+    resetBridgeBtsppOnRetryState();
+    handled = true;
+  }
+
+  if (line.indexOf("ACK BT SCAN") >= 0) {
+    bridgeBtLastAck = "ACK BT SCAN";
+    bridgeBtScanInProgress = true;
+    bridgeBtLastScanMs = millis();
+    bridgeBtLastError = "";
+    handled = true;
+  }
+
+  if (line.indexOf("[BT] AUTO CONNECT OK") >= 0 || line.indexOf("AUTO CONNECT OK") >= 0) {
+    bridgeBtLastAck = "AUTO CONNECT OK";
+    bridgeBtLastError = "";
+    handled = true;
+    Serial.println("[BRIDGE] AUTO CONNECT OK -> start retry BTSPP_ON (max 3, co 2s)");
+    triggerBridgeBtsppOnRetryStart();
+    serviceBridgeBtsppOnRetry(millis());
+  }
+
+  if (line.indexOf("BTDISC_OK") >= 0) {
+    bridgeBtLastDiscStatus = "BTDISC_OK";
+    handled = true;
+  }
+  if (line.indexOf("BTDISC_ERR") >= 0) {
+    bridgeBtLastDiscStatus = "BTDISC_ERR";
+    handled = true;
+  }
+
+  int listBeginPos = line.indexOf("BT[LIST_BEGIN]:");
+  if (listBeginPos >= 0) {
+    int countStart = listBeginPos + (int)strlen("BT[LIST_BEGIN]:");
+    int countEnd = countStart;
+    while (countEnd < (int)line.length() && isdigit((unsigned char)line.charAt(countEnd))) {
+      countEnd++;
+    }
+    String countStr = line.substring(countStart, countEnd);
+    countStr.trim();
+    bridgeBtListExpected = (countStr.length() > 0) ? countStr.toInt() : -1;
+    clearBridgeBtScanList();
+    bridgeBtListCollecting = true;
+    bridgeBtScanInProgress = true;
+    handled = true;
+  }
+
+  String nameParsed;
+  String addrParsed;
+  if (parseBridgeBtNameLine(line, nameParsed, addrParsed)) {
+    addOrUpdateBridgeBtDevice(nameParsed, addrParsed);
+    bridgeBtListCollecting = true;
+    bridgeBtScanInProgress = true;
+    handled = true;
+  }
+
+  if (line.indexOf("BT[LIST_END]") >= 0) {
+    bridgeBtListCollecting = false;
+    bridgeBtScanInProgress = false;
+    bridgeBtLastScanMs = millis();
+    handled = true;
+
+    if (bridgeBtAutoConnectPending && bridgeBtPairedAddress.length() == 12) {
+      requestBridgePairConnect(bridgeBtPairedName, bridgeBtPairedAddress, "", true);
+      bridgeBtAutoConnectPending = false;
+    }
+  }
+
+  int errPos = line.indexOf("BT[ERROR]:");
+  if (errPos >= 0) {
+    String errPayload = line.substring(errPos + 10);
+    int btEnd = errPayload.indexOf("[BT]");
+    if (btEnd >= 0) {
+      errPayload = errPayload.substring(0, btEnd);
+    }
+    errPayload.trim();
+    bridgeBtLastError = errPayload;
+    bridgeBtScanInProgress = false;
+    bridgeBtListCollecting = false;
+    handled = true;
+  }
+
+  if (line.indexOf("BTCNT_OK") >= 0) {
+    bridgeBtPairPending = false;
+    bridgeBtPairLastResult = 1;
+    bridgeBtPairLastResultMs = millis();
+    handled = true;
+
+    if (bridgeBtPairPendingAddress.length() == 12) {
+      bridgeBtPairedAddress = bridgeBtPairPendingAddress;
+      bridgeBtPairedName = bridgeBtPairPendingName;
+      saveBridgeBtPairingToNvs();
+    }
+
+    bridgeBtPairPendingAddress = "";
+    bridgeBtPairPendingName = "";
+    Serial.println("[BRIDGE] BTCNT_OK -> start retry BTSPP_ON (max 3, co 2s)");
+    triggerBridgeBtsppOnRetryStart();
+    serviceBridgeBtsppOnRetry(millis());
+  }
+
+  if (line.indexOf("BTCNT_ERR") >= 0) {
+    bridgeBtPairPending = false;
+    bridgeBtPairLastResult = -1;
+    bridgeBtPairLastResultMs = millis();
+    bridgeBtLastError = "BTCNT_ERR";
+    bridgeBtPairPendingAddress = "";
+    bridgeBtPairPendingName = "";
+    handled = true;
+  }
+
+  return handled;
+}
+
+static bool isLikelyAprsTnc2Frame(const String &line) {
+  if (line.length() < 10 || line.length() > 340) {
+    return false;
+  }
+
+  if (line.startsWith("ASSERT") || line.startsWith("Guru Meditation") || line.startsWith("E (")) {
+    return false;
+  }
+
+  int gtPos = line.indexOf('>');
+  if (gtPos < 3 || gtPos > 15) {
+    return false;
+  }
+
+  int colonPos = line.indexOf(':', gtPos + 1);
+  if (colonPos < 0 || colonPos <= (gtPos + 1) || colonPos >= (int)line.length() - 1) {
+    return false;
+  }
+
+  String source = line.substring(0, gtPos);
+  source.trim();
+  if (!isAprsCallsignTokenValid(source)) {
+    return false;
+  }
+
+  return true;
+}
+
+static bool isYaesuUiMonitorHeaderLine(const String &line) {
+  if (line.length() < 12) {
+    return false;
+  }
+  if (line.indexOf("] <UI") < 0) {
+    return false;
+  }
+  return line.endsWith(">:");
+}
+
+static String normalizeYaesuUiHeaderToAprsPrefix(const String &headerLine) {
+  String prefix = headerLine;
+  int uiPos = prefix.lastIndexOf(" <UI");
+  if (uiPos < 0 || !prefix.endsWith(">:")) {
+    return prefix;
+  }
+
+  int timestampPos = prefix.lastIndexOf(" [", uiPos);
+  if (timestampPos >= 0 && prefix.indexOf("] <UI", timestampPos) >= 0) {
+    prefix = prefix.substring(0, timestampPos);
+  } else {
+    prefix = prefix.substring(0, uiPos);
+  }
+  prefix += ":";
+  return prefix;
+}
+
+static void handleUartAprsKissFrame(const uint8_t *frame, size_t len) {
+  if (!isUart2AprsKissParsingEnabled()) {
+    return;
+  }
+  if (len < 2) {
+    return;
+  }
+
+  uint8_t portCmd = frame[0];
+  if ((portCmd & 0x0F) != 0x00) {
+    return;
+  }
+
+  String line = decodeKissPayloadToTnc2(frame + 1, len - 1);
+  if (line.length() == 0) {
+    return;
+  }
+
+  if (!isLikelyAprsTnc2Frame(line)) {
+    return;
+  }
+
+  processAprsFrameFromLine(line, "UART2/KISS");
+}
+
+static void handleUartAprsTextLine(String line) {
+  if (!isUart2AprsTextParsingEnabled()) {
+    return;
+  }
+
+  stripKnownUartNoiseTokens(line);
+  processBridgeControlLine(line);
+  stripBridgeControlTokensFromLine(line);
+  line.trim();
+  if (line.length() == 0) {
+    return;
+  }
+
+  if (line.startsWith("#")) {
+    return;
+  }
+
+  // Yaesu Packet Monitor: naglowek jest w osobnej linii, payload w nastepnej.
+  if (uart2YaesuUiAprsPrefix.length() > 0) {
+    String combined = uart2YaesuUiAprsPrefix + line;
+    uart2YaesuUiAprsPrefix = "";
+    combined.trim();
+    if (isLikelyAprsTnc2Frame(combined)) {
+      processAprsFrameFromLine(combined, "UART2/TNC2");
+      return;
+    }
+  }
+
+  if (isYaesuUiMonitorHeaderLine(line)) {
+    uart2YaesuUiAprsPrefix = normalizeYaesuUiHeaderToAprsPrefix(line);
+    return;
+  }
+
+  int cursor = 0;
+  while (cursor < (int)line.length()) {
+    int start = findAprsFrameStartInText(line, cursor);
+    if (start < 0) {
+      break;
+    }
+
+    int gtPos = line.indexOf('>', start);
+    if (gtPos < 0) {
+      break;
+    }
+
+    int colonPos = line.indexOf(':', gtPos + 1);
+    if (colonPos < 0) {
+      break;
+    }
+
+    int nextStart = findAprsFrameStartInText(line, colonPos + 1);
+    int end = (nextStart >= 0) ? nextStart : (int)line.length();
+    if (end <= start) {
+      cursor = start + 1;
+      continue;
+    }
+
+    String candidate = line.substring(start, end);
+    candidate.trim();
+    if (isLikelyAprsTnc2Frame(candidate)) {
+      processAprsFrameFromLine(candidate, "UART2/TNC2");
+    }
+
+    cursor = end;
+  }
+}
+
+static void processUartAprsByte(uint8_t b) {
+  if (!isUart2AprsUartSourceEnabled()) {
+    return;
+  }
+
+  if (isUart2AprsKissParsingEnabled()) {
+    if (b == 0xC0) {
+      if (uart2KissInFrame && uart2KissFrameLen > 0) {
+        handleUartAprsKissFrame(uart2KissFrame, uart2KissFrameLen);
+      }
+      uart2KissInFrame = true;
+      uart2KissEscape = false;
+      uart2KissFrameLen = 0;
+      return;
+    }
+
+    if (uart2KissInFrame) {
+      if (uart2KissEscape) {
+        uart2KissEscape = false;
+        if (b == 0xDC) {
+          b = 0xC0;
+        } else if (b == 0xDD) {
+          b = 0xDB;
+        }
+      } else if (b == 0xDB) {
+        uart2KissEscape = true;
+        return;
+      }
+
+      if (uart2KissFrameLen < sizeof(uart2KissFrame)) {
+        uart2KissFrame[uart2KissFrameLen++] = b;
+      } else {
+        uart2KissFrameLen = 0;
+        uart2KissInFrame = false;
+        uart2KissEscape = false;
+      }
+      return;
+    }
+  }
+
+  if (b == '\r' || b == '\n') {
+    if (uart2AprsLine.length() > 0) {
+      String line = uart2AprsLine;
+      uart2AprsLine = "";
+      handleUartAprsTextLine(line);
+    }
+    return;
+  }
+
+  if (uart2AprsLine.length() < 512) {
+    uart2AprsLine += (char)b;
+  } else {
+    uart2AprsLine = "";
+  }
+}
+
+static void pollGpsSerial() {
+  if (!isUart2GpsParsingEnabled() && !isUart2AprsUartSourceEnabled()) {
+    return;
+  }
+
+  unsigned long nowMs = millis();
+  bool gpsParsingEnabled = isUart2GpsParsingEnabled();
+  bool rawBridgeActive = gpsParsingEnabled && ((nowMs - gpsRawBridgeStartMs) < GPS_RAW_BRIDGE_WINDOW_MS);
+
+  if (rawBridgeActive && (nowMs - gpsRawLastStatsMs) >= GPS_RAW_STATS_INTERVAL_MS) {
+    gpsRawLastStatsMs = nowMs;
+    Serial.printf("[GPS RAW] Odebrane bajty (ostatnie 5 s): %lu | suma: %lu\n",
+                  (unsigned long)gpsRawBytesSinceStats,
+                  (unsigned long)gpsRawBytesTotal);
+    gpsRawBytesSinceStats = 0;
+  }
+
+  if (!rawBridgeActive && !gpsRawBridgeEndLogged) {
+    Serial.printf("[GPS RAW] Koniec trybu testowego po 60 s | suma odebranych bajtow: %lu\n",
+                  (unsigned long)gpsRawBytesTotal);
+    gpsRawBridgeEndLogged = true;
+  }
+
+  while (gpsSerial.available() > 0) {
+    char c = (char)gpsSerial.read();
+    gpsLastRxMs = nowMs;
+    gpsRawBytesTotal++;
+    gpsRawBytesSinceStats++;
+
+    if (rawBridgeActive) {
+      Serial.write((uint8_t)c);
+    }
+
+    if (isUart2AprsUartSourceEnabled()) {
+      processUartAprsByte((uint8_t)c);
+    }
+
+    if (!gpsParsingEnabled) {
+      continue;
+    }
+
+    if (c == '\r') {
+      continue;
+    }
+
+    if (c == '\n') {
+      if (gpsNmeaLine.length() > 6) {
+        parseGpsNmeaSentence(gpsNmeaLine);
+      }
+      gpsNmeaLine = "";
+      continue;
+    }
+
+    if (gpsNmeaLine.length() < 160) {
+      gpsNmeaLine += c;
+    } else {
+      gpsNmeaLine = "";
+    }
+  }
+}
+
+static bool isGpsFixActive(unsigned long nowMs) {
+  bool rmcFreshFix = gpsRmcFix && gpsLastRmcMs != 0 && (nowMs - gpsLastRmcMs) <= GPS_FIX_FRESHNESS_MS;
+  bool ggaFreshFix = gpsGgaFix && gpsLastGgaMs != 0 && (nowMs - gpsLastGgaMs) <= GPS_FIX_FRESHNESS_MS;
+  return rmcFreshFix || ggaFreshFix;
+}
+
+static bool isGpsUartActive(unsigned long nowMs) {
+  return gpsLastRxMs != 0 && (nowMs - gpsLastRxMs) <= GPS_UART_ACTIVE_TIMEOUT_MS;
+}
+
+static bool getServiceCoordinatesForServices(double &lat, double &lon) {
+  if (useGpsIfActive) {
+    unsigned long nowMs = millis();
+    if (gpsLocationValid && isGpsFixActive(nowMs)) {
+      lat = gpsLatitude;
+      lon = gpsLongitude;
+      return true;
+    }
+  }
+
+  if (userLatLonValid) {
+    lat = userLat;
+    lon = userLon;
+    return true;
+  }
+
+  if (userLocator.length() >= 4) {
+    locatorToLatLon(userLocator, lat, lon);
+    return true;
+  }
+
+  return false;
+}
+
+static String formatGpsUtcForLog() {
+  if (gpsUtcTime.length() < 6) {
+    return "brak czasu";
+  }
+
+  String hhmmss = gpsUtcTime.substring(0, 2) + ":" + gpsUtcTime.substring(2, 4) + ":" + gpsUtcTime.substring(4, 6);
+  if (gpsUtcDate.length() < 6) {
+    return hhmmss + " UTC";
+  }
+
+  String dd = gpsUtcDate.substring(0, 2);
+  String mm = gpsUtcDate.substring(2, 4);
+  int yy = gpsUtcDate.substring(4, 6).toInt();
+  int fullYear = (yy >= 80) ? (1900 + yy) : (2000 + yy);
+
+  return String(fullYear) + "-" + mm + "-" + dd + " " + hhmmss + " UTC";
+}
+
+static bool isGpsUtcFieldSixDigits(const String &value) {
+  if (value.length() < 6) {
+    return false;
+  }
+
+  for (int i = 0; i < 6; i++) {
+    if (!isdigit((unsigned char)value.charAt(i))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool isGpsTimeSourceActive(unsigned long nowMs) {
+  if (!isUart2GpsParsingEnabled()) {
+    return false;
+  }
+  if (!isGpsUartActive(nowMs) || !isGpsFixActive(nowMs)) {
+    return false;
+  }
+  return isGpsUtcFieldSixDigits(gpsUtcTime) && isGpsUtcFieldSixDigits(gpsUtcDate);
+}
+
+static int64_t daysFromCivilUtc(int year, unsigned month, unsigned day) {
+  year -= (month <= 2);
+  const int era = (year >= 0 ? year : year - 399) / 400;
+  const unsigned yoe = (unsigned)(year - era * 400);
+  const unsigned doy = (153U * (month + (month > 2 ? -3 : 9)) + 2U) / 5U + day - 1U;
+  const unsigned doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+  return (int64_t)era * 146097LL + (int64_t)doe - 719468LL;
+}
+
+static bool parseGpsUtcToUnix(time_t &outUtcSeconds) {
+  if (!isGpsUtcFieldSixDigits(gpsUtcTime) || !isGpsUtcFieldSixDigits(gpsUtcDate)) {
+    return false;
+  }
+
+  int day = gpsUtcDate.substring(0, 2).toInt();
+  int month = gpsUtcDate.substring(2, 4).toInt();
+  int yy = gpsUtcDate.substring(4, 6).toInt();
+  int hour = gpsUtcTime.substring(0, 2).toInt();
+  int minute = gpsUtcTime.substring(2, 4).toInt();
+  int second = gpsUtcTime.substring(4, 6).toInt();
+
+  if (day < 1 || day > 31 || month < 1 || month > 12) {
+    return false;
+  }
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+    return false;
+  }
+
+  int fullYear = (yy >= 80) ? (1900 + yy) : (2000 + yy);
+  int64_t daysSinceEpoch = daysFromCivilUtc(fullYear, (unsigned)month, (unsigned)day);
+  int64_t unixSeconds = daysSinceEpoch * 86400LL + (int64_t)hour * 3600LL + (int64_t)minute * 60LL + (int64_t)second;
+  if (unixSeconds < 100000LL) {
+    return false;
+  }
+
+  outUtcSeconds = (time_t)unixSeconds;
+  return true;
+}
+
+static uint64_t makeGpsDateTimeToken() {
+  uint64_t token = 0;
+  for (int i = 0; i < 6; i++) {
+    token = token * 10ULL + (uint64_t)(gpsUtcDate.charAt(i) - '0');
+  }
+  for (int i = 0; i < 6; i++) {
+    token = token * 10ULL + (uint64_t)(gpsUtcTime.charAt(i) - '0');
+  }
+  return token;
+}
+
+static bool syncSystemTimeFromGps(unsigned long nowMs) {
+  if (!isGpsTimeSourceActive(nowMs)) {
+    return false;
+  }
+
+  static uint64_t lastSyncedToken = 0;
+  uint64_t currentToken = makeGpsDateTimeToken();
+  if (currentToken == lastSyncedToken) {
+    return true;
+  }
+
+  time_t utcSeconds = 0;
+  if (!parseGpsUtcToUnix(utcSeconds)) {
+    return false;
+  }
+
+  struct timeval tv;
+  tv.tv_sec = utcSeconds;
+  tv.tv_usec = 0;
+  if (settimeofday(&tv, nullptr) != 0) {
+    return false;
+  }
+
+  lastSyncedToken = currentToken;
+  return true;
+}
+
+static void logGpsStatusEvery5s(unsigned long nowMs) {
+  if (!isUart2GpsParsingEnabled()) {
+    return;
+  }
+
+  if (gpsLastStatusLogMs != 0 && (nowMs - gpsLastStatusLogMs) < GPS_STATUS_LOG_INTERVAL_MS) {
+    return;
+  }
+  gpsLastStatusLogMs = nowMs;
+
+  bool fix = isGpsFixActive(nowMs);
+  String gpsUtc = formatGpsUtcForLog();
+  String satsInViewText = (gpsSatellitesInView >= 0) ? String(gpsSatellitesInView) : String("--");
+  String satsUsedText = (gpsSatellitesUsed >= 0) ? String(gpsSatellitesUsed) : String("--");
+
+  if (fix && gpsLocationValid) {
+    Serial.printf("[GPS] FIX=TAK SAT_VIEW=%s SAT_USED=%s LAT=%.6f LON=%.6f UTC=%s\n",
+                  satsInViewText.c_str(),
+                  satsUsedText.c_str(),
+                  gpsLatitude,
+                  gpsLongitude,
+                  gpsUtc.c_str());
+  } else {
+    Serial.printf("[GPS] FIX=NIE SAT_VIEW=%s SAT_USED=%s UTC=%s\n",
+                  satsInViewText.c_str(),
+                  satsUsedText.c_str(),
+                  gpsUtc.c_str());
+  }
+}
+
 // ========== INICJALIZACJA TFT (ESP32-2432S028) ==========
 #ifdef ENABLE_TFT_DISPLAY
 void setupBacklightPwm() {
@@ -1042,10 +3274,10 @@ void setupBacklightPwm() {
 #endif
 }
 
-void setBacklightPercent(int percent) {
+static void writeBacklightPwmPercent(int percent) {
   if (percent < MIN_BACKLIGHT_PERCENT) percent = MIN_BACKLIGHT_PERCENT;
   if (percent > 100) percent = 100;
-  backlightPercent = percent;
+  currentBacklightAppliedPercent = percent;
   uint32_t dutyMax = (1U << BACKLIGHT_PWM_RES_BITS) - 1U;
   uint32_t duty = (percent * dutyMax) / 100U;
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
@@ -1053,6 +3285,71 @@ void setBacklightPercent(int percent) {
 #else
   ledcWrite(BACKLIGHT_PWM_CHANNEL, duty);
 #endif
+}
+
+static bool getWeatherIsNightFromIcon(bool &isNight) {
+  String iconCodeLocal;
+  bool weatherValidLocal = false;
+
+  lockWeatherData();
+  weatherValidLocal = weatherData.valid;
+  iconCodeLocal = weatherData.iconCode;
+  unlockWeatherData();
+
+  iconCodeLocal.trim();
+  iconCodeLocal.toLowerCase();
+  if (!weatherValidLocal || iconCodeLocal.length() == 0) {
+    return false;
+  }
+  if (iconCodeLocal.endsWith("n")) {
+    isNight = true;
+    return true;
+  }
+  if (iconCodeLocal.endsWith("d")) {
+    isNight = false;
+    return true;
+  }
+  return false;
+}
+
+static int getTargetBacklightPercentForCurrentDayNight() {
+  int targetPercent = backlightPercent;
+  if (targetPercent < MIN_BACKLIGHT_PERCENT) targetPercent = MIN_BACKLIGHT_PERCENT;
+  if (targetPercent > 100) targetPercent = 100;
+
+  bool isNight = false;
+  bool hasWeatherDayNight = getWeatherIsNightFromIcon(isNight);
+  if (!hasWeatherDayNight || !isNight || tftNightDimmingPercent <= 0) {
+    return targetPercent;
+  }
+
+  int dimming = tftNightDimmingPercent;
+  if (dimming < 0) dimming = 0;
+  if (dimming > 100) dimming = 100;
+
+  int reducedPercent = (targetPercent * (100 - dimming)) / 100;
+  if (reducedPercent < MIN_BACKLIGHT_PERCENT) reducedPercent = MIN_BACKLIGHT_PERCENT;
+  if (reducedPercent > 100) reducedPercent = 100;
+  return reducedPercent;
+}
+
+static void applyBacklightByDayNight(bool forceApply) {
+  if (!tftInitialized || brightnessMenuActive) {
+    return;
+  }
+  int targetPercent = getTargetBacklightPercentForCurrentDayNight();
+  if (!forceApply && targetPercent == currentBacklightAppliedPercent) {
+    return;
+  }
+  writeBacklightPwmPercent(targetPercent);
+}
+
+void setBacklightPercent(int percent) {
+  if (percent < MIN_BACKLIGHT_PERCENT) percent = MIN_BACKLIGHT_PERCENT;
+  if (percent > 100) percent = 100;
+  backlightPercent = percent;
+  int targetPercent = getTargetBacklightPercentForCurrentDayNight();
+  writeBacklightPwmPercent(targetPercent);
 }
 
 void applyTouchRotation() {
@@ -1142,23 +3439,23 @@ void drawWelcomeScreenYellow() {
     return;
   }
   tft.fillScreen(TFT_BLACK);
+  // Optional startup background from LittleFS (data/logo.bmp)
+  drawBmpFromFS("/logo.bmp", 0, 0);
   tft.setTextSize(1);
   const int centerX = 160;
   const int startY = 40;
   const int lineGap = 16;
   String lines[] = {
     "ESP32-HAM-CLOCK",
-    "version 1.2",
+    "version 1.3.0",
     "Created by SP3KON",
     "(AI-assisted)",
     "sp3kon@gmail.com",
     ""
   };
   for (int i = 0; i < 6; i++) {
-    int textWidth = lines[i].length() * 12;
-    int x = centerX - (textWidth / 2);
-    tft.setTextColor(TFT_YELLOW);
-    tft.setCursor(x, startY + i * lineGap);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.setCursor(5, startY + i * lineGap);
     tft.print(lines[i]);
   }
 }
@@ -1176,7 +3473,7 @@ void drawWelcomeScreenGreen() {
   String line = "FOLLOW THE PROPAGATION...";
   int textWidth = line.length() * 12;
   int x = centerX - (textWidth / 2);
-  tft.setCursor(x, startY + 6 * lineGap);
+  tft.setCursor(x, startY + 6 * lineGap + 25);
   tft.print(line);
 }
 
@@ -1318,6 +3615,7 @@ void updateTFT_Spots() {
 
 extern TaskHandle_t uiTaskHandle;
 static void requestUiScreenRedraw(uint8_t pendingScreenId);
+void drawLokalizacja();
 
 // GĹ‚Ăłwna funkcja rysujÄ…ca ekrany
 void drawScreen(ScreenType screenNum) {
@@ -1346,7 +3644,11 @@ void drawScreen(ScreenType screenNum) {
     return;
   }
   
-  tft.fillScreen(TFT_BLACK);
+  if (screenNum == SCREEN_MATRIX_CLOCK || screenNum == SCREEN_UNLIS_HUNTER) {
+    tft.fillScreen(TFT_BLACK);
+  } else {
+    tft.fillScreen(tftUiPalette.bg);
+  }
   
   switch (screenNum) {
     case SCREEN_HAM_CLOCK:
@@ -1366,6 +3668,9 @@ void drawScreen(ScreenType screenNum) {
       break;
     case SCREEN_WEATHER_FORECAST:
       drawWeatherForecast();
+      break;
+    case SCREEN_LOKALIZACJA:
+      drawLokalizacja();
       break;
     case SCREEN_APRS_IS:
       drawAprsIs();
@@ -1392,6 +3697,204 @@ void drawScreen(ScreenType screenNum) {
   }
 }
 
+static void drawLokalizacjaValueField(int x, int y, int width, uint16_t color, const String &value) {
+  uint16_t bgColor = isTftStyleLight() ? TFT_WHITE : TFT_BLACK;
+  tft.fillRect(x, y - 2, width, 20, bgColor);
+  tft.setTextColor(color);
+  tft.setCursor(x, y);
+  tft.print(value);
+}
+
+static const int LOK_SAVE_BTN_X = 246;
+static const int LOK_SAVE_BTN_Y = 6;
+static const int LOK_SAVE_BTN_W = 68;
+static const int LOK_SAVE_BTN_H = 24;
+
+static bool isLokalizacjaSaveButtonHit(uint16_t x, uint16_t y) {
+  const int hitPaddingX = 10;
+  const int hitPaddingY = 10;
+  const int hitX = max(0, LOK_SAVE_BTN_X - hitPaddingX);
+  const int hitY = max(0, LOK_SAVE_BTN_Y - hitPaddingY);
+  const int hitW = min(320 - hitX, LOK_SAVE_BTN_W + 2 * hitPaddingX);
+  const int hitH = min(240 - hitY, LOK_SAVE_BTN_H + 2 * hitPaddingY);
+  return isPointInRect(x, y, hitX, hitY, hitW, hitH);
+}
+
+static void drawLokalizacjaSaveButton() {
+  bool isEn = (tftLanguage == TFT_LANG_EN);
+  const char *btnLabel = isEn ? "SAVE" : "ZAPISZ";
+  uint16_t btnFill = TFT_WHITE;
+  uint16_t btnBorder = TFT_BLACK;
+  uint16_t btnText = TFT_BLACK;
+  int textW = strlen(btnLabel) * 6;
+
+  tft.fillRoundRect(LOK_SAVE_BTN_X, LOK_SAVE_BTN_Y, LOK_SAVE_BTN_W, LOK_SAVE_BTN_H, 4, btnFill);
+  tft.drawRoundRect(LOK_SAVE_BTN_X, LOK_SAVE_BTN_Y, LOK_SAVE_BTN_W, LOK_SAVE_BTN_H, 4, btnBorder);
+  tft.setTextSize(1);
+  tft.setTextColor(btnText);
+  tft.setCursor(LOK_SAVE_BTN_X + (LOK_SAVE_BTN_W - textW) / 2, LOK_SAVE_BTN_Y + 8);
+  tft.print(btnLabel);
+}
+
+static String latLonToMaidenhead6(double lat, double lon) {
+  if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+    return "--";
+  }
+
+  if (lat >= 90.0) lat = 89.999999;
+  if (lon >= 180.0) lon = 179.999999;
+
+  double lonAdj = lon + 180.0;
+  double latAdj = lat + 90.0;
+
+  int fieldLon = (int)(lonAdj / 20.0);
+  int fieldLat = (int)(latAdj / 10.0);
+  if (fieldLon < 0 || fieldLon > 17 || fieldLat < 0 || fieldLat > 17) {
+    return "--";
+  }
+
+  double lonAfterField = lonAdj - (fieldLon * 20.0);
+  double latAfterField = latAdj - (fieldLat * 10.0);
+
+  int squareLon = (int)(lonAfterField / 2.0);
+  int squareLat = (int)(latAfterField / 1.0);
+  if (squareLon < 0) squareLon = 0;
+  if (squareLon > 9) squareLon = 9;
+  if (squareLat < 0) squareLat = 0;
+  if (squareLat > 9) squareLat = 9;
+
+  double lonAfterSquare = lonAfterField - (squareLon * 2.0);
+  double latAfterSquare = latAfterField - (squareLat * 1.0);
+
+  int subLon = (int)(lonAfterSquare * 12.0);
+  int subLat = (int)(latAfterSquare * 24.0);
+  if (subLon < 0) subLon = 0;
+  if (subLon > 23) subLon = 23;
+  if (subLat < 0) subLat = 0;
+  if (subLat > 23) subLat = 23;
+
+  String locator = "";
+  locator += (char)('A' + fieldLon);
+  locator += (char)('A' + fieldLat);
+  locator += (char)('0' + squareLon);
+  locator += (char)('0' + squareLat);
+  locator += (char)('A' + subLon);
+  locator += (char)('A' + subLat);
+  return locator;
+}
+
+static void updateLokalizacjaFields() {
+  unsigned long nowMs = millis();
+  bool gpsActive = isGpsUartActive(nowMs);
+  bool gpsFix = isGpsFixActive(nowMs);
+  bool isEn = (tftLanguage == TFT_LANG_EN);
+  bool lightTheme = isTftStyleLight();
+  uint16_t bgColor = lightTheme ? TFT_WHITE : TFT_BLACK;
+
+  String gpsText = gpsActive ? (isEn ? "ACTIVE" : "aktywny") : (isEn ? "INACTIVE" : "nieaktywny");
+  String fixText = gpsFix ? (isEn ? "YES" : "TAK") : (isEn ? "NO" : "NIE");
+  String satsInView = (gpsSatellitesInView >= 0) ? String(gpsSatellitesInView) : String("--");
+  String latText = gpsLocationValid ? String(gpsLatitude, 6) : String("--");
+  String lonText = gpsLocationValid ? String(gpsLongitude, 6) : String("--");
+  String speedText = (gpsSpeedKmh >= 0.0f) ? (String(gpsSpeedKmh, 1) + " km/h") : String("--");
+  String locatorText = gpsLocationValid ? latLonToMaidenhead6(gpsLatitude, gpsLongitude) : String("--");
+
+  uint16_t gpsLabelColor = lightTheme ? TFT_BLACK : TFT_WHITE;
+  uint16_t gpsValueColor = lightTheme ? TFT_BLACK : (gpsActive ? TFT_GREEN : TFT_RED);
+  uint16_t fixValueColor = lightTheme ? TFT_BLACK : (gpsFix ? TFT_GREEN : TFT_RED);
+  uint16_t satsColor = lightTheme ? TFT_BLACK : TFT_CYAN;
+  uint16_t latColor = lightTheme ? TFT_BLACK : TFT_YELLOW;
+  uint16_t lonColor = lightTheme ? TFT_BLACK : TFT_YELLOW;
+  uint16_t speedColor = lightTheme ? TFT_BLACK : TFT_CYAN;
+  uint16_t locatorColor = lightTheme ? TFT_BLACK : TFT_CYAN;
+
+  tft.setTextSize(2);
+  tft.fillRect(20, 60, 290, 20, bgColor);
+  tft.setCursor(20, 62);
+  tft.setTextColor(gpsLabelColor);
+  tft.print("GPS: ");
+  tft.setTextColor(gpsValueColor);
+  tft.print(gpsText);
+  tft.setTextColor(gpsLabelColor);
+  tft.print(" FIX: ");
+  tft.setTextColor(fixValueColor);
+  tft.print(fixText);
+  drawLokalizacjaValueField(130, 88, 170, satsColor, satsInView);
+  drawLokalizacjaValueField(130, 114, 170, latColor, latText);
+  drawLokalizacjaValueField(130, 140, 170, lonColor, lonText);
+  drawLokalizacjaValueField(130, 166, 170, speedColor, speedText);
+  drawLokalizacjaValueField(130, 192, 170, locatorColor, locatorText);
+}
+
+void drawLokalizacja() {
+
+  bool isEn = (tftLanguage == TFT_LANG_EN);
+  bool lightTheme = isTftStyleLight();
+  uint16_t pageBgColor = lightTheme ? TFT_WHITE : TFT_BLACK;
+  uint16_t labelColor = lightTheme ? TFT_BLACK : TFT_WHITE;
+  uint16_t frameOuterColor = TFT_DARKGREY;
+  uint16_t frameMidColor = lightTheme ? TFT_BLACK : TFT_LIGHTGREY;
+  uint16_t frameInnerColor = lightTheme ? TFT_BLACK : TFT_WHITE;
+
+  tft.fillScreen(pageBgColor);
+  tft.fillRect(0, 0, 320, 40, menuThemeColor);
+  tft.drawFastHLine(0, 39, 320, 0x8410);
+
+  const String headerText = isEn ? "LOCATION" : "LOKALIZACJA";
+  int headerX = (320 - ((int)headerText.length() * 12)) / 2;
+  if (headerX < 6) {
+    headerX = 6;
+  }
+  tft.setTextColor(TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(headerX, 12);
+  tft.print(headerText);
+  tft.setCursor(headerX + 1, 12);
+  tft.print(headerText);
+  drawLokalizacjaSaveButton();
+
+  const int frameX = 10;
+  const int frameY = 50;
+  const int frameW = 300;
+  const int frameH = 170;
+  const int frameR = 8;
+  tft.drawRoundRect(frameX - 2, frameY - 2, frameW + 4, frameH + 4, frameR + 2, frameOuterColor);
+  tft.drawRoundRect(frameX - 1, frameY - 1, frameW + 2, frameH + 2, frameR + 1, frameMidColor);
+  tft.drawRoundRect(frameX, frameY, frameW, frameH, frameR, frameInnerColor);
+
+  tft.setTextSize(2);
+  tft.setTextColor(labelColor);
+
+  int y = 88;
+  const int rowH = 26;
+  tft.setTextColor(labelColor);
+  tft.setCursor(20, y);
+  tft.print(isEn ? "SATS:" : "Satelity:");
+
+  y += rowH;
+  tft.setTextColor(labelColor);
+  tft.setCursor(20, y);
+  tft.print("LAT:");
+
+  y += rowH;
+  tft.setTextColor(labelColor);
+  tft.setCursor(20, y);
+  tft.print("LON:");
+
+  y += rowH;
+  tft.setTextColor(labelColor);
+  tft.setCursor(20, y);
+  tft.print(isEn ? "SPEED:" : "Predkosc:");
+
+  y += rowH;
+  tft.setTextColor(labelColor);
+  tft.setCursor(20, y);
+  tft.print(isEn ? "LOCATOR:" : "Lokator:");
+
+  updateLokalizacjaFields();
+  drawSwitchScreenFooter();
+}
+
 // Ekran 1: Startowy - Info
 uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
   return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
@@ -1412,6 +3915,7 @@ uint16_t colorWheel(uint8_t pos) {
 
 void applyMenuThemeFromHue() {
   menuThemeColor = colorWheel(menuThemeHue);
+  applyTftUiPalette();
 }
 
 // Definicja koloru "Radio Orange" - dynamiczny motyw
@@ -1547,7 +4051,7 @@ bool getTimeWithTimezone(struct tm *outTm) {
   if (now < 100000) {
     return false;
   }
-  now += (time_t)timezoneHours * 3600;
+  now += (time_t)(timezoneHours * 3600.0f);
   gmtime_r(&now, outTm);
   return true;
 }
@@ -1571,7 +4075,7 @@ String formatAprsTimeWithTimezone(String timeStr) {
   }
   int hour = timeStr.substring(0, 2).toInt();
   int minute = timeStr.substring(2, 4).toInt();
-  int hourLocal = hour + timezoneHours;
+  int hourLocal = hour + (int)timezoneHours;
   while (hourLocal < 0) hourLocal += 24;
   while (hourLocal >= 24) hourLocal -= 24;
   String hh = (hourLocal < 10 ? "0" : "") + String(hourLocal);
@@ -1618,28 +4122,50 @@ String sanitizePolishToAscii(const String &input) {
   return out;
 }
 
+static inline const char* utf8LiteralToChar(const char *s) {
+  return s;
+}
+
+#if defined(__cpp_char8_t)
+static inline const char* utf8LiteralToChar(const char8_t *s) {
+  return reinterpret_cast<const char*>(s);
+}
+#endif
+
 String getPolishDateStringFull() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo, 1)) {
     return "Brak daty";
   }
 
-  static const char* weekdaysFull[] = {
+  #if defined(__cpp_char8_t)
+  static const char8_t* const weekdaysFull[] = {
     u8"Niedziela", u8"Poniedzia\u0142ek", u8"Wtorek",
     u8"\u015Aroda", u8"Czwartek", u8"Pi\u0105tek", u8"Sobota"
   };
-  static const char* monthsFull[] = {
+  static const char8_t* const monthsFull[] = {
     u8"stycznia", u8"lutego", u8"marca", u8"kwietnia",
     u8"maja", u8"czerwca", u8"lipca", u8"sierpnia",
     u8"wrze\u015Bnia", u8"pa\u017Adziernika", u8"listopada", u8"grudnia"
   };
+  #else
+  static const char* const weekdaysFull[] = {
+    u8"Niedziela", u8"Poniedzia\u0142ek", u8"Wtorek",
+    u8"\u015Aroda", u8"Czwartek", u8"Pi\u0105tek", u8"Sobota"
+  };
+  static const char* const monthsFull[] = {
+    u8"stycznia", u8"lutego", u8"marca", u8"kwietnia",
+    u8"maja", u8"czerwca", u8"lipca", u8"sierpnia",
+    u8"wrze\u015Bnia", u8"pa\u017Adziernika", u8"listopada", u8"grudnia"
+  };
+  #endif
 
   String dateBuf = String(timeinfo.tm_mday < 10 ? "0" : "") + String(timeinfo.tm_mday) +
                    "." +
                    String((timeinfo.tm_mon + 1) < 10 ? "0" : "") + String(timeinfo.tm_mon + 1) +
                    "." + String(1900 + timeinfo.tm_year);
 
-  String full = String(weekdaysFull[timeinfo.tm_wday]) + " " + dateBuf;
+  String full = String(utf8LiteralToChar(weekdaysFull[timeinfo.tm_wday])) + " " + dateBuf;
   return full;
 }
 
@@ -1669,17 +4195,24 @@ String getPolishDateStringFullWithTimezone() {
     return "Brak daty";
   }
 
-  static const char* weekdaysFull[] = {
+  #if defined(__cpp_char8_t)
+  static const char8_t* const weekdaysFull[] = {
     u8"Niedziela", u8"Poniedzia\u0142ek", u8"Wtorek",
     u8"\u015Aroda", u8"Czwartek", u8"Pi\u0105tek", u8"Sobota"
   };
+  #else
+  static const char* const weekdaysFull[] = {
+    u8"Niedziela", u8"Poniedzia\u0142ek", u8"Wtorek",
+    u8"\u015Aroda", u8"Czwartek", u8"Pi\u0105tek", u8"Sobota"
+  };
+  #endif
 
   String dateBuf = String(timeinfo.tm_mday < 10 ? "0" : "") + String(timeinfo.tm_mday) +
                    "." +
                    String((timeinfo.tm_mon + 1) < 10 ? "0" : "") + String(timeinfo.tm_mon + 1) +
                    "." + String(1900 + timeinfo.tm_year);
 
-  String full = String(weekdaysFull[timeinfo.tm_wday]) + " " + dateBuf;
+  String full = String(utf8LiteralToChar(weekdaysFull[timeinfo.tm_wday])) + " " + dateBuf;
   return full;
 }
 
@@ -1715,8 +4248,7 @@ void drawDateLine(const String &dateText) {
   int textW = 0;
   int textH = 0;
 
-  if (littleFsReady && LittleFS.exists(ROBOTO_FONT20_FILE)) {
-    tft.loadFont(ROBOTO_FONT20_NAME, LittleFS);
+  if (tryLoadSmoothFont(ROBOTO_FONT20_NAME, ROBOTO_FONT20_FILE)) {
     fontLoaded = true;
     textW = tft.textWidth(dateText);
     textH = tft.fontHeight();
@@ -1746,8 +4278,11 @@ void drawDateLine(const String &dateText) {
   const int cleanBottom = (frameY + frameHeight) - 5;
   const int cleanH = cleanBottom - cleanY;
 
-  tft.fillRect(cleanX, cleanY, cleanW, cleanH, TFT_BLACK);
-  tft.setTextColor(TFT_WHITE);
+  const bool lightTheme = isTftStyleLight();
+  const uint16_t dateBg = lightTheme ? TFT_WHITE : TFT_BLACK;
+  const uint16_t dateFg = lightTheme ? TFT_BLACK : TFT_WHITE;
+  tft.fillRect(cleanX, cleanY, cleanW, cleanH, dateBg);
+  tft.setTextColor(dateFg);
 
   if (fontLoaded) {
     tft.setTextDatum(TL_DATUM);
@@ -1755,7 +4290,7 @@ void drawDateLine(const String &dateText) {
     tft.unloadFont();
   } else {
     tft.setCursor(dateX, dateY);
-    tft.print(dateText);
+    tft.print(sanitizePolishToAscii(dateText));
   }
 }
 
@@ -1770,11 +4305,16 @@ void updateScreen1Header() {
 
   const int headerY = 0;
   const int headerH = 40;
+  const uint16_t headerBg = TFT_RADIO_ORANGE;
+  const uint16_t headerText = TFT_BLACK;
+  const uint16_t logoBlockBg = TFT_BLACK;
+  const uint16_t logoBlockText = TFT_RADIO_ORANGE;
+  const uint16_t lineColor = 0x8410;
   
   // 1. TĹO I RAMKA LOGO
-  tft.fillRect(0, headerY, 320, headerH, TFT_RADIO_ORANGE);
+  tft.fillRect(0, headerY, 320, headerH, headerBg);
   // Ciemniejsza krawÄ™dĹş na dole dla efektu 3D
-  tft.drawFastHLine(0, headerH - 1, 320, 0x8410); 
+  tft.drawFastHLine(0, headerH - 1, 320, lineColor); 
 
   // 2. FORMATOWANIE "LOGO"
   
@@ -1782,14 +4322,14 @@ void updateScreen1Header() {
   int textY = 12;
 
   // CzÄ™Ĺ›Ä‡ 1: "ESP32" w czarnym prostokÄ…cie (negatyw)
-  tft.fillRect(startX, textY - 4, 65, 22, TFT_BLACK);
-  tft.setTextColor(TFT_RADIO_ORANGE);
+  tft.fillRect(startX, textY - 4, 65, 22, logoBlockBg);
+  tft.setTextColor(logoBlockText);
   tft.setTextSize(2);
   tft.setCursor(startX + 5, textY);
   tft.print("ESP32");
 
   // CzÄ™Ĺ›Ä‡ 2: "-HAM-" (standardowo)
-  tft.setTextColor(TFT_BLACK);
+  tft.setTextColor(headerText);
   tft.setCursor(startX + 75, textY);
   tft.print("-HAM-");
 
@@ -1802,25 +4342,80 @@ void updateScreen1Header() {
 
   // 3. OZDOBNIK GRAFICZNY (Fale radiowe)
   for(int i = 0; i < 3; i++) {
-    tft.drawCircle(300, 20, 4 + (i * 4), TFT_BLACK);
+    tft.drawCircle(300, 20, 4 + (i * 4), headerText);
   }
 
   screen1HeaderNeedsRedraw = false;
 }
 
+static const unsigned long SCREEN1_GPS_BADGE_INTERVAL_MS = 4000UL;
+static const unsigned long SCREEN1_GPS_BADGE_VISIBLE_MS = 2000UL;
+
+static void drawHamClockConnectionIndicator(bool connected, bool lightTheme) {
+  const int indicatorCx = 50;
+  const int indicatorCy = 222;
+  const int indicatorMaxR = 12;
+  const int indicatorClearPad = 2;
+  const int indicatorClearX = indicatorCx - indicatorMaxR - indicatorClearPad;
+  const int indicatorClearY = indicatorCy - indicatorMaxR - indicatorClearPad;
+  const int indicatorClearW = 2 * (indicatorMaxR + indicatorClearPad);
+  const int indicatorClearH = 2 * (indicatorMaxR + indicatorClearPad);
+
+  tft.fillRect(indicatorClearX, indicatorClearY, indicatorClearW, indicatorClearH, lightTheme ? TFT_WHITE : TFT_BLACK);
+
+  unsigned long nowMs = millis();
+  bool gpsBadgeVisible = false;
+  if (isUart2GpsParsingEnabled()) {
+    bool gpsActive = isGpsUartActive(nowMs);
+    bool gpsFix = isGpsFixActive(nowMs);
+    gpsBadgeVisible = gpsActive && gpsFix && ((nowMs % SCREEN1_GPS_BADGE_INTERVAL_MS) < SCREEN1_GPS_BADGE_VISIBLE_MS);
+  }
+
+  if (!connected) {
+    if (gpsBadgeVisible) {
+      tft.fillCircle(indicatorCx, indicatorCy, indicatorMaxR, TFT_GREEN);
+      tft.drawCircle(indicatorCx, indicatorCy, indicatorMaxR, lightTheme ? TFT_BLACK : TFT_WHITE);
+      tft.setTextSize(1);
+      tft.setTextColor(TFT_BLACK, TFT_GREEN);
+      tft.setCursor(indicatorCx - 9, indicatorCy - 3);
+      tft.print("GPS");
+    } else {
+      tft.fillCircle(indicatorCx, indicatorCy, 4, TFT_RED);
+    }
+    return;
+  }
+
+  if (gpsBadgeVisible) {
+    tft.fillCircle(indicatorCx, indicatorCy, indicatorMaxR, TFT_GREEN);
+    tft.drawCircle(indicatorCx, indicatorCy, indicatorMaxR, lightTheme ? TFT_BLACK : TFT_WHITE);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_BLACK, TFT_GREEN);
+    tft.setCursor(indicatorCx - 9, indicatorCy - 3);
+    tft.print("GPS");
+  } else {
+    tft.fillCircle(indicatorCx, indicatorCy, 4, TFT_GREEN);
+  }
+}
+
 void drawHamClock() {
+  const bool lightTheme = isTftStyleLight();
+  const uint16_t bgColor = lightTheme ? TFT_WHITE : TFT_BLACK;
+  const uint16_t fgColor = lightTheme ? TFT_BLACK : TFT_WHITE;
+  const uint16_t frameColor = lightTheme ? TFT_BLACK : TFT_DARKGREY;
+  const uint16_t accentColor = lightTheme ? TFT_BLACK : TFT_RADIO_ORANGE;
+  const uint16_t ipColor = lightTheme ? TFT_BLACK : TFT_LIGHTGREY;
   // Ciemne tĹ‚o - profesjonalny wyglÄ…d i mniejsze zmÄ™czenie oczu
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(bgColor);
   screen1HeaderNeedsRedraw = true;
   
   // 1. NAGĹĂ“WEK - PomaraĹ„czowa belka
   updateScreen1Header();
 
   // 2. RAMKA GĹĂ“WNA
-  tft.drawRoundRect(10, 50, 300, 155, 8, TFT_DARKGREY);
+  tft.drawRoundRect(10, 50, 300, 155, 8, frameColor);
 
   // 3. CALLSIGN (sp3kon) - PrzesuniÄ™ty wyĹĽej
-  tft.setTextColor(TFT_WHITE);
+  tft.setTextColor(fgColor);
   tft.setTextSize(4);
   String callsign = (userCallsign.length() > 0) ? userCallsign : DEFAULT_CALLSIGN;
   callsign.toUpperCase();
@@ -1830,13 +4425,13 @@ void drawHamClock() {
 
   // Napis "OPERATOR STATION"
   tft.setTextSize(1);
-  tft.setTextColor(TFT_RADIO_ORANGE);
+  tft.setTextColor(accentColor);
   tft.setCursor(110, 105);
   tft.print("OPERATOR STATION");
 
   // 4. ZEGAR UTC - WielkoĹ›Ä‡ taka sama jak Callsign (TextSize 4)
   // Ograniczenie do obszaru ramki gĹ‚Ăłwnej (x=10, szerokoĹ›Ä‡=300)
-  tft.setTextColor(TFT_WHITE);
+  tft.setTextColor(fgColor);
   tft.setTextSize(4);
   String timeUTC = (screen1TimeMode == SCREEN1_TIME_LOCAL)
                      ? getTimezoneTimeString("%H:%M:%S", 9)
@@ -1884,28 +4479,25 @@ void drawHamClock() {
   }
 
   if (connected) {
-    tft.setTextColor(TFT_LIGHTGREY);
+    tft.setTextColor(ipColor);
     tft.setTextSize(2);
     String ipStr = ip.toString();
     int ipX = (320 - (ipStr.length() * 12)) / 2;
     tft.setCursor(ipX, 215);
     tft.print(ipStr);
-    
-    // MaĹ‚y zielony indykator poĹ‚Ä…czenia
-    tft.fillCircle(50, 222, 4, TFT_GREEN);
   } else {
-    tft.setTextColor(TFT_RED);
+    tft.setTextColor(lightTheme ? TFT_BLACK : TFT_RED);
     tft.setTextSize(2);
     tft.setCursor(80, 215);
     tft.print("NO CONNECTION");
-    tft.fillCircle(50, 222, 4, TFT_RED);
   }
+  drawHamClockConnectionIndicator(connected, lightTheme);
     // 4. STRZAĹKI ZMIANY EKRANU (Nawigacja)
   // Lewa strzaĹ‚ka (TrĂłjkÄ…t: x1, y1, x2, y2, x3, y3, kolor)
-  tft.fillTriangle(10, 230, 20, 222, 20, 238, TFT_RADIO_ORANGE);
+  tft.fillTriangle(10, 230, 20, 222, 20, 238, accentColor);
   
   // Prawa strzaĹ‚ka
-  tft.fillTriangle(310, 230, 300, 222, 300, 238, TFT_RADIO_ORANGE);
+  tft.fillTriangle(310, 230, 300, 222, 300, 238, accentColor);
   
 
 }
@@ -1940,13 +4532,22 @@ void updateScreen1Clock() {
     cleanW = (frameX + frameWidth - 5) - cleanX;
   }
   
-  tft.fillRect(cleanX, timeBoxY, cleanW, timeBoxH, TFT_BLACK);
+  const bool lightTheme = isTftStyleLight();
+  tft.fillRect(cleanX, timeBoxY, cleanW, timeBoxH, lightTheme ? TFT_WHITE : TFT_BLACK);
 
   // WyĹ›wietl zegar
-  tft.setTextColor(TFT_WHITE);
+  tft.setTextColor(lightTheme ? TFT_BLACK : TFT_WHITE);
   tft.setTextSize(4);
   tft.setCursor(timeX, 125);
   tft.print(timeUTC);
+
+  bool connected = false;
+  if (wifiConnected && WiFi.status() == WL_CONNECTED) {
+    connected = true;
+  } else if (WiFi.getMode() & WIFI_AP) {
+    connected = true;
+  }
+  drawHamClockConnectionIndicator(connected, lightTheme);
 }
 
 void updateScreen1Date() {
@@ -2011,9 +4612,9 @@ void updateScreen2Clock() {
   int timeWidth = strlen(timeBuffer) * 12;
   int timeX = 315 - timeWidth;
 
-  // WyczyĹ›Ä‡ tylko obszar godziny w nagĹ‚Ăłwku (pomaraĹ„czowy pasek)
-  tft.fillRect(timeX - 2, 4, timeWidth + 6, 24, TFT_RADIO_ORANGE);
-  tft.setTextColor(TFT_BLACK);
+  // WyczyĹ›Ä‡ tylko obszar godziny w nagĹ‚Ăłwku.
+  tft.fillRect(timeX - 2, 4, timeWidth + 6, 24, tftHeaderBgColor());
+  tft.setTextColor(tftHeaderTextColor());
   tft.setTextSize(2);
   tft.setCursor(timeX, 8);
   tft.print(timeBuffer);
@@ -2021,61 +4622,139 @@ void updateScreen2Clock() {
 }
 
 bool spotMatchesScreen2Filters(const DXSpot &spot) {
-  if (screen2FilterMode != FILTER_MODE_ALL) {
-    if (screen2FilterMode == FILTER_MODE_CW && spot.mode != "CW") return false;
-    if (screen2FilterMode == FILTER_MODE_SSB && spot.mode != "SSB") return false;
-    if (screen2FilterMode == FILTER_MODE_DIGI && !(spot.mode == "FT8" || spot.mode == "FT4")) return false;
-  }
-  if (screen2FilterBandIndex > 0 && screen2FilterBandIndex < SCREEN8_FILTER_BANDS_COUNT) {
-    String selectedBand = SCREEN8_FILTER_BANDS[screen2FilterBandIndex];
-    float freqMHz = spot.frequency;
+  return spotMatchesModeFilter(spot.mode, screen2FilterModeMask) &&
+         spotMatchesBandFilter(spot, screen2FilterBandMask, SCREEN8_FILTER_BANDS, SCREEN8_FILTER_BANDS_COUNT);
+}
 
+uint8_t getModeFilterBitForIndex(int index) {
+  switch (index) {
+    case FILTER_MODE_CW:
+      return FILTER_MODE_BIT_CW;
+    case FILTER_MODE_SSB:
+      return FILTER_MODE_BIT_SSB;
+    case FILTER_MODE_DIGI:
+      return FILTER_MODE_BIT_DIGI;
+    default:
+      return 0;
+  }
+}
+
+uint16_t getBandFilterBitForIndex(int index) {
+  if (index <= 0 || index >= 16) {
+    return 0;
+  }
+  return (uint16_t)1u << (index - 1);
+}
+
+bool isModeFilterTileSelected(uint8_t mask, int index) {
+  if (index == FILTER_MODE_ALL) {
+    return mask == 0;
+  }
+  return (mask & getModeFilterBitForIndex(index)) != 0;
+}
+
+bool isBandFilterTileSelected(uint16_t mask, int index) {
+  if (index == 0) {
+    return mask == 0;
+  }
+  return (mask & getBandFilterBitForIndex(index)) != 0;
+}
+
+void toggleModeFilterSelection(uint8_t &mask, int index) {
+  if (index == FILTER_MODE_ALL) {
+    mask = 0;
+    return;
+  }
+
+  uint8_t bit = getModeFilterBitForIndex(index);
+  if (bit == 0) {
+    return;
+  }
+
+  mask ^= bit;
+}
+
+void toggleBandFilterSelection(uint16_t &mask, int index) {
+  if (index == 0) {
+    mask = 0;
+    return;
+  }
+
+  uint16_t bit = getBandFilterBitForIndex(index);
+  if (bit == 0) {
+    return;
+  }
+
+  mask ^= bit;
+}
+
+bool spotMatchesModeFilter(const String &modeRaw, uint8_t mask) {
+  if (mask == 0) {
+    return true;
+  }
+
+  String mode = modeRaw;
+  mode.toUpperCase();
+
+  if ((mask & FILTER_MODE_BIT_CW) && mode == "CW") {
+    return true;
+  }
+  if ((mask & FILTER_MODE_BIT_SSB) && mode == "SSB") {
+    return true;
+  }
+  if ((mask & FILTER_MODE_BIT_DIGI) && (mode == "FT8" || mode == "FT4")) {
+    return true;
+  }
+  return false;
+}
+
+bool spotMatchesBandFilter(const DXSpot &spot, uint16_t mask, const char **bands, int bandCount) {
+  if (mask == 0) {
+    return true;
+  }
+
+  float freqMHz = spot.frequency;
+  for (int index = 1; index < bandCount; index++) {
+    uint16_t bit = getBandFilterBitForIndex(index);
+    if ((mask & bit) == 0) {
+      continue;
+    }
+
+    String selectedBand = bands[index];
     if (selectedBand == "VHF") {
-      if (!(freqMHz >= 30.0f && freqMHz < 300.0f)) return false;
-    } else if (selectedBand == "UHF") {
-      if (!(freqMHz >= 300.0f && freqMHz < 3000.0f)) return false;
-    } else if (selectedBand == "SHF") {
-      if (!(freqMHz >= 3000.0f && freqMHz < 30000.0f)) return false;
-    } else {
-      if (spot.band != selectedBand) return false;
+      if (freqMHz >= 30.0f && freqMHz < 300.0f) {
+        return true;
+      }
+      continue;
+    }
+    if (selectedBand == "UHF") {
+      if (freqMHz >= 300.0f && freqMHz < 3000.0f) {
+        return true;
+      }
+      continue;
+    }
+    if (selectedBand == "SHF") {
+      if (freqMHz >= 3000.0f && freqMHz < 30000.0f) {
+        return true;
+      }
+      continue;
+    }
+    if (spot.band == selectedBand) {
+      return true;
     }
   }
-  return true;
+
+  return false;
 }
 
 bool spotMatchesScreen7Filters(const DXSpot &spot) {
-  if (screen7FilterMode != FILTER_MODE_ALL) {
-    if (screen7FilterMode == FILTER_MODE_CW && spot.mode != "CW") return false;
-    if (screen7FilterMode == FILTER_MODE_SSB && spot.mode != "SSB") return false;
-    if (screen7FilterMode == FILTER_MODE_DIGI && !(spot.mode == "FT8" || spot.mode == "FT4")) return false;
-  }
-  if (screen7FilterBandIndex > 0 && screen7FilterBandIndex < SCREEN2_FILTER_BANDS_COUNT) {
-    if (spot.band != SCREEN2_FILTER_BANDS[screen7FilterBandIndex]) return false;
-  }
-  return true;
+  return spotMatchesModeFilter(spot.mode, screen7FilterModeMask) &&
+         spotMatchesBandFilter(spot, screen7FilterBandMask, SCREEN2_FILTER_BANDS, SCREEN2_FILTER_BANDS_COUNT);
 }
 
 bool spotMatchesScreen8Filters(const DXSpot &spot) {
-  if (screen8FilterMode != FILTER_MODE_ALL) {
-    if (screen8FilterMode == FILTER_MODE_CW && spot.mode != "CW") return false;
-    if (screen8FilterMode == FILTER_MODE_SSB && spot.mode != "SSB") return false;
-    if (screen8FilterMode == FILTER_MODE_DIGI && !(spot.mode == "FT8" || spot.mode == "FT4")) return false;
-  }
-  if (screen8FilterBandIndex > 0 && screen8FilterBandIndex < SCREEN8_FILTER_BANDS_COUNT) {
-    String selectedBand = SCREEN8_FILTER_BANDS[screen8FilterBandIndex];
-    float freqMHz = spot.frequency;
-
-    if (selectedBand == "VHF") {
-      if (!(freqMHz >= 30.0f && freqMHz < 300.0f)) return false;
-    } else if (selectedBand == "UHF") {
-      if (!(freqMHz >= 300.0f && freqMHz < 3000.0f)) return false;
-    } else if (selectedBand == "SHF") {
-      if (!(freqMHz >= 3000.0f && freqMHz < 30000.0f)) return false;
-    } else {
-      if (spot.band != selectedBand) return false;
-    }
-  }
-  return true;
+  return spotMatchesModeFilter(spot.mode, screen8FilterModeMask) &&
+         spotMatchesBandFilter(spot, screen8FilterBandMask, SCREEN8_FILTER_BANDS, SCREEN8_FILTER_BANDS_COUNT);
 }
 
 float getAprsSortDistance(const APRSStation &s) {
@@ -2083,6 +4762,11 @@ float getAprsSortDistance(const APRSStation &s) {
     return s.distance;
   }
   return 1.0e9f;
+}
+
+static int roundAprsDistanceKm(float km) {
+  // Odległość APRS jest nieujemna; +0.5f daje zaokrąglenie do pełnego km zamiast obcinania.
+  return (int)(km + 0.5f);
 }
 
 bool aprsSortLess(int a, int b) {
@@ -2143,9 +4827,9 @@ uint32_t computeScreen2Signature() {
   lockDxSpots();
   hash ^= (uint32_t)spotCount;
   hash *= fnvPrime;
-  hash ^= (uint32_t)screen2FilterMode;
+  hash ^= (uint32_t)screen2FilterModeMask;
   hash *= fnvPrime;
-  hash ^= (uint32_t)screen2FilterBandIndex;
+  hash ^= (uint32_t)screen2FilterBandMask;
   hash *= fnvPrime;
   hash ^= (uint32_t)dxTableSizeMode;
   hash *= fnvPrime;
@@ -2221,24 +4905,24 @@ void updateScreen2Data() {
   TFT_eSprite *tableSprite = (navVisible && ensureSharedTableSprite()) ? &sharedTableSprite : nullptr;
 
   if (tableSprite != nullptr) {
-    tableSprite->fillSprite(TFT_BLACK);
+    tableSprite->fillSprite(tftUiPalette.bg);
 
     int yPos = 8;
-    tableSprite->setTextColor(TFT_DARKGREY);
+    tableSprite->setTextColor(tftUiPalette.muted);
     tableSprite->setTextSize(1);
     if (enlarged) {
       tableSprite->setCursor(5, yPos);   tableSprite->print("UTC");
       tableSprite->setCursor(74, yPos);  tableSprite->print("CALL");
-      tableSprite->setCursor(204, yPos); tableSprite->print("MHz");
-      tableSprite->setCursor(282, yPos); tableSprite->print("MODE");
+      tableSprite->setCursor(191, yPos); tableSprite->print("MHz");
+      tableSprite->setCursor(274, yPos); tableSprite->print("MODE");
     } else {
       tableSprite->setCursor(5, yPos);   tableSprite->print("UTC");
       tableSprite->setCursor(50, yPos);  tableSprite->print("CALLSIGN");
       tableSprite->setCursor(125, yPos); tableSprite->print("MHz");
-      tableSprite->setCursor(190, yPos); tableSprite->print("MODE");
-      tableSprite->setCursor(220, yPos); tableSprite->print(tr(TR_COUNTRY));
+      tableSprite->setCursor(182, yPos); tableSprite->print("MODE");
+      tableSprite->setCursor(212, yPos); tableSprite->print(tr(TR_COUNTRY));
     }
-    tableSprite->drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
+    tableSprite->drawFastHLine(0, yPos + 10, 320, tftUiPalette.muted);
     yPos += enlarged ? 20 : 18;
 
     int displayCount = 0;
@@ -2252,26 +4936,26 @@ void updateScreen2Data() {
       }
       if (enlarged) {
         if (displayCount % 2 == 0) {
-          tableSprite->fillRect(0, yPos - 5, 320, 24, TFT_TABLE_ALT_ROW_COLOR);
+          tableSprite->fillRect(0, yPos - 5, 320, 24, tftUiPalette.rowAlt);
         }
 
         tableSprite->setTextSize(2);
-        tableSprite->setTextColor(TFT_LIGHTGREY);
+        tableSprite->setTextColor(tftUiPalette.muted);
         tableSprite->setCursor(5, yPos);
         tableSprite->print(formatSpotUtc(spots[i].time));
 
-        tableSprite->setTextColor(TFT_WHITE);
+        tableSprite->setTextColor(tftUiPalette.fg);
         tableSprite->setCursor(74, yPos);
         String callText = spots[i].callsign;
-        if (callText.length() > 8) callText = callText.substring(0, 8);
+        if (callText.length() > 9) callText = callText.substring(0, 9);
         tableSprite->print(callText);
 
-        tableSprite->setTextColor(TFT_YELLOW);
-        tableSprite->setCursor(204, yPos);
+        tableSprite->setTextColor(tftTableFreqColor());
+        tableSprite->setCursor(191, yPos);
         tableSprite->print(spots[i].frequency / 1000.0, 3);
 
-        tableSprite->setTextColor(TFT_GREEN);
-        tableSprite->setCursor(282, yPos);
+        tableSprite->setTextColor(tftTableModeColor());
+        tableSprite->setCursor(274, yPos);
         String modeText = spots[i].mode;
         if (modeText.length() > 4) modeText = modeText.substring(0, 4);
         tableSprite->print(modeText);
@@ -2279,29 +4963,29 @@ void updateScreen2Data() {
         yPos += 27;
       } else {
         if (displayCount % 2 == 0) {
-          tableSprite->fillRect(0, yPos - 2, 320, 16, TFT_TABLE_ALT_ROW_COLOR);
+          tableSprite->fillRect(0, yPos - 2, 320, 16, tftUiPalette.rowAlt);
         }
 
         tableSprite->setTextSize(1);
 
-        tableSprite->setTextColor(TFT_LIGHTGREY);
+        tableSprite->setTextColor(tftUiPalette.muted);
         tableSprite->setCursor(5, yPos);
         tableSprite->print(formatSpotUtc(spots[i].time));
 
-        tableSprite->setTextColor(TFT_WHITE);
+        tableSprite->setTextColor(tftUiPalette.fg);
         tableSprite->setCursor(50, yPos);
         tableSprite->print(spots[i].callsign);
 
-        tableSprite->setTextColor(TFT_YELLOW);
+        tableSprite->setTextColor(tftTableFreqColor());
         tableSprite->setCursor(125, yPos);
         tableSprite->print(spots[i].frequency / 1000.0, 3);
 
-        tableSprite->setTextColor(TFT_GREEN);
-        tableSprite->setCursor(190, yPos);
+        tableSprite->setTextColor(tftTableModeColor());
+        tableSprite->setCursor(182, yPos);
         tableSprite->print(spots[i].mode);
 
-        tableSprite->setTextColor(TFT_RADIO_ORANGE);
-        tableSprite->setCursor(220, yPos);
+        tableSprite->setTextColor(tftTableAccentTextColor());
+        tableSprite->setCursor(212, yPos);
         String countryText = formatDistanceOrCountry(spots[i], COUNTRY_COL_MAX_LEN);
         tableSprite->print(countryText);
 
@@ -2323,24 +5007,24 @@ void updateScreen2Data() {
   }
 
   // Fallback bez sprite (np. gdy zabraknie RAM)
-  tft.fillRect(0, tableTop, 320, tableHeight, TFT_BLACK);
+  tft.fillRect(0, tableTop, 320, tableHeight, tftUiPalette.bg);
 
   int yPos = 40;
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(tftUiPalette.muted);
   tft.setTextSize(1);
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(204, yPos); tft.print("MHz");
-    tft.setCursor(282, yPos); tft.print("MODE");
+    tft.setCursor(191, yPos); tft.print("MHz");
+    tft.setCursor(274, yPos); tft.print("MODE");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("MHz");
-    tft.setCursor(190, yPos); tft.print("MODE");
-    tft.setCursor(220, yPos); tft.print(tr(TR_COUNTRY));
+    tft.setCursor(182, yPos); tft.print("MODE");
+    tft.setCursor(212, yPos); tft.print(tr(TR_COUNTRY));
   }
-  tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
+  tft.drawFastHLine(0, yPos + 10, 320, tftUiPalette.muted);
   yPos += enlarged ? 20 : 18;
 
   int displayCount = 0;
@@ -2354,26 +5038,26 @@ void updateScreen2Data() {
     }
     if (enlarged) {
       if (displayCount % 2 == 0) {
-        tft.fillRect(0, yPos - 5, 320, 24, TFT_TABLE_ALT_ROW_COLOR);
+        tft.fillRect(0, yPos - 5, 320, 24, tftUiPalette.rowAlt);
       }
 
       tft.setTextSize(2);
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       tft.print(formatSpotUtc(spots[i].time));
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(74, yPos);
       String callText = spots[i].callsign;
-      if (callText.length() > 8) callText = callText.substring(0, 8);
+      if (callText.length() > 9) callText = callText.substring(0, 9);
       tft.print(callText);
 
-      tft.setTextColor(TFT_YELLOW);
-      tft.setCursor(204, yPos);
+      tft.setTextColor(tftTableFreqColor());
+      tft.setCursor(191, yPos);
       tft.print(spots[i].frequency / 1000.0, 3);
 
-      tft.setTextColor(TFT_GREEN);
-      tft.setCursor(282, yPos);
+      tft.setTextColor(tftTableModeColor());
+      tft.setCursor(274, yPos);
       String modeText = spots[i].mode;
       if (modeText.length() > 4) modeText = modeText.substring(0, 4);
       tft.print(modeText);
@@ -2381,29 +5065,29 @@ void updateScreen2Data() {
       yPos += 27;
     } else {
       if (displayCount % 2 == 0) {
-        tft.fillRect(0, yPos - 2, 320, 16, TFT_TABLE_ALT_ROW_COLOR);
+        tft.fillRect(0, yPos - 2, 320, 16, tftUiPalette.rowAlt);
       }
 
       tft.setTextSize(1);
 
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       tft.print(formatSpotUtc(spots[i].time));
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(50, yPos);
       tft.print(spots[i].callsign);
 
-      tft.setTextColor(TFT_YELLOW);
+      tft.setTextColor(tftTableFreqColor());
       tft.setCursor(125, yPos);
       tft.print(spots[i].frequency / 1000.0, 3);
 
-      tft.setTextColor(TFT_GREEN);
-      tft.setCursor(190, yPos);
+      tft.setTextColor(tftTableModeColor());
+      tft.setCursor(182, yPos);
       tft.print(spots[i].mode);
 
-      tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(220, yPos);
+      tft.setTextColor(tftTableAccentTextColor());
+      tft.setCursor(212, yPos);
       String countryText = formatDistanceOrCountry(spots[i], COUNTRY_COL_MAX_LEN);
       tft.print(countryText);
 
@@ -2425,8 +5109,8 @@ void updateScreen2Data() {
 void drawPotaCluster() {
   // Użyj tych samych współrzędnych co w drawHamClock() - ograniczenie do obszaru ramki
 
-  tft.fillRect(0, 0, 320, 32, TFT_RADIO_ORANGE);
-  tft.setTextColor(TFT_BLACK);
+  tft.fillRect(0, 0, 320, 32, tftHeaderBgColor());
+  tft.setTextColor(tftHeaderTextColor());
 
   drawHamburgerMenuButton3D(5, 7);
 
@@ -2446,58 +5130,59 @@ void drawPotaCluster() {
 
   int yPos = 40;
   const bool enlarged = isDxTableEnlarged();
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(tftUiPalette.muted);
   tft.setTextSize(1);
 
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(204, yPos); tft.print("MHz");
-    tft.setCursor(282, yPos); tft.print("MODE");
+    tft.setCursor(191, yPos); tft.print("MHz");
+    tft.setCursor(274, yPos); tft.print("MODE");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("MHz");
-    tft.setCursor(190, yPos); tft.print("MODE");
-    tft.setCursor(220, yPos); tft.print(tr(TR_COUNTRY));
+    tft.setCursor(182, yPos); tft.print("MODE");
+    tft.setCursor(212, yPos); tft.print(tr(TR_COUNTRY));
   }
-  tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
+  tft.drawFastHLine(0, yPos + 10, 320, tftUiPalette.muted);
   yPos += enlarged ? 20 : 18;
 
   int maxRows = getPotaTableMaxRows();
   int displayCount = 0;
+  lockPotaSpots();
   for (int i = 0; i < potaSpotCount && displayCount < maxRows; i++) {
     if (!spotMatchesScreen7Filters(potaSpots[i])) continue;
     if (enlarged) {
-      if (displayCount % 2 == 0) tft.fillRect(0, yPos - 5, 320, 24, TFT_TABLE_ALT_ROW_COLOR);
+      if (displayCount % 2 == 0) tft.fillRect(0, yPos - 5, 320, 24, tftUiPalette.rowAlt);
 
       tft.setTextSize(2);
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       tft.print(formatSpotUtc(potaSpots[i].time));
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(74, yPos);
       String callText = potaSpots[i].callsign;
-      if (callText.length() > 8) callText = callText.substring(0, 8);
+      if (callText.length() > 9) callText = callText.substring(0, 9);
       tft.print(callText);
 
-      tft.setTextColor(TFT_YELLOW);
-      tft.setCursor(204, yPos);
+      tft.setTextColor(tftTableFreqColor());
+      tft.setCursor(191, yPos);
       tft.print(potaSpots[i].frequency, 3);
 
-      tft.setTextColor(TFT_GREEN);
-      tft.setCursor(282, yPos);
+      tft.setTextColor(tftTableModeColor());
+      tft.setCursor(274, yPos);
       String modeText = potaSpots[i].mode;
       if (modeText.length() > 4) modeText = modeText.substring(0, 4);
       tft.print(modeText);
 
       yPos += 27;
     } else {
-      if (displayCount % 2 == 0) tft.fillRect(0, yPos - 2, 320, 16, TFT_TABLE_ALT_ROW_COLOR);
+      if (displayCount % 2 == 0) tft.fillRect(0, yPos - 2, 320, 16, tftUiPalette.rowAlt);
 
       tft.setTextSize(1);
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       String timeStr = potaSpots[i].time;
       // Obsłuż ISO 8601 z datą: wyciągnij HH:MM
@@ -2508,20 +5193,20 @@ void drawPotaCluster() {
       if (timeStr.length() > 5) timeStr = timeStr.substring(0, 5);
       tft.print(timeStr);
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(50, yPos);
       tft.print(potaSpots[i].callsign);
 
-      tft.setTextColor(TFT_YELLOW);
+      tft.setTextColor(tftTableFreqColor());
       tft.setCursor(125, yPos);
       tft.print(potaSpots[i].frequency, 3); // frequency już w MHz
 
-      tft.setTextColor(TFT_GREEN);
-      tft.setCursor(190, yPos);
+      tft.setTextColor(tftTableModeColor());
+      tft.setCursor(182, yPos);
       tft.print(potaSpots[i].mode);
 
-      tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(220, yPos);
+      tft.setTextColor(tftTableAccentTextColor());
+      tft.setCursor(212, yPos);
       String countryText = formatDistanceOrCountry(potaSpots[i], COUNTRY_COL_MAX_LEN);
       tft.print(countryText);
 
@@ -2529,6 +5214,7 @@ void drawPotaCluster() {
     }
     displayCount++;
   }
+  unlockPotaSpots();
 
   if (isTableNavFooterVisible(SCREEN_POTA_CLUSTER)) {
     drawSwitchScreenFooter();
@@ -2557,8 +5243,8 @@ void updateScreen7Clock() {
   int timeWidth = strlen(timeBuffer) * 12;
   int timeX = 315 - timeWidth;
 
-  tft.fillRect(timeX - 2, 4, timeWidth + 6, 24, TFT_RADIO_ORANGE);
-  tft.setTextColor(TFT_BLACK);
+  tft.fillRect(timeX - 2, 4, timeWidth + 6, 24, tftHeaderBgColor());
+  tft.setTextColor(tftHeaderTextColor());
   tft.setTextSize(2);
   tft.setCursor(timeX, 8);
   tft.print(timeBuffer);
@@ -2568,11 +5254,12 @@ uint32_t computeScreen7Signature() {
   const uint32_t fnvPrime = 16777619u;
   uint32_t hash = 2166136261u;
 
+  lockPotaSpots();
   hash ^= (uint32_t)potaSpotCount;
   hash *= fnvPrime;
-  hash ^= (uint32_t)screen7FilterMode;
+  hash ^= (uint32_t)screen7FilterModeMask;
   hash *= fnvPrime;
-  hash ^= (uint32_t)screen7FilterBandIndex;
+  hash ^= (uint32_t)screen7FilterBandMask;
   hash *= fnvPrime;
   hash ^= (uint32_t)dxTableSizeMode;
   hash *= fnvPrime;
@@ -2605,6 +5292,7 @@ uint32_t computeScreen7Signature() {
     }
     displayCount++;
   }
+  unlockPotaSpots();
 
   return hash;
 }
@@ -2632,27 +5320,28 @@ void updateScreen7Data() {
   TFT_eSprite *tableSprite = (navVisible && ensureSharedTableSprite()) ? &sharedTableSprite : nullptr;
 
   if (tableSprite != nullptr) {
-    tableSprite->fillSprite(TFT_BLACK);
+    tableSprite->fillSprite(tftUiPalette.bg);
 
     int yPos = 8;
-    tableSprite->setTextColor(TFT_DARKGREY);
+    tableSprite->setTextColor(tftUiPalette.muted);
     tableSprite->setTextSize(1);
     if (enlarged) {
       tableSprite->setCursor(5, yPos);   tableSprite->print("UTC");
       tableSprite->setCursor(74, yPos);  tableSprite->print("CALL");
-      tableSprite->setCursor(204, yPos); tableSprite->print("MHz");
-      tableSprite->setCursor(282, yPos); tableSprite->print("MODE");
+      tableSprite->setCursor(191, yPos); tableSprite->print("MHz");
+      tableSprite->setCursor(274, yPos); tableSprite->print("MODE");
     } else {
       tableSprite->setCursor(5, yPos);   tableSprite->print("UTC");
       tableSprite->setCursor(50, yPos);  tableSprite->print("CALLSIGN");
       tableSprite->setCursor(125, yPos); tableSprite->print("MHz");
-      tableSprite->setCursor(190, yPos); tableSprite->print("MODE");
-      tableSprite->setCursor(220, yPos); tableSprite->print(tr(TR_COUNTRY));
+      tableSprite->setCursor(182, yPos); tableSprite->print("MODE");
+      tableSprite->setCursor(212, yPos); tableSprite->print(tr(TR_COUNTRY));
     }
-    tableSprite->drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
+    tableSprite->drawFastHLine(0, yPos + 10, 320, tftUiPalette.muted);
     yPos += enlarged ? 20 : 18;
 
     int displayCount = 0;
+    lockPotaSpots();
     for (int i = 0; i < potaSpotCount && displayCount < maxRows; i++) {
       if (!spotMatchesScreen7Filters(potaSpots[i])) continue;
       if (yPos >= (tableHeight - 2)) {
@@ -2660,27 +5349,27 @@ void updateScreen7Data() {
       }
       if (enlarged) {
         if (displayCount % 2 == 0) {
-          tableSprite->fillRect(0, yPos - 5, 320, 24, TFT_TABLE_ALT_ROW_COLOR);
+          tableSprite->fillRect(0, yPos - 5, 320, 24, tftUiPalette.rowAlt);
         }
 
         tableSprite->setTextSize(2);
 
-        tableSprite->setTextColor(TFT_LIGHTGREY);
+        tableSprite->setTextColor(tftUiPalette.muted);
         tableSprite->setCursor(5, yPos);
         tableSprite->print(formatSpotUtc(potaSpots[i].time));
 
-        tableSprite->setTextColor(TFT_WHITE);
+        tableSprite->setTextColor(tftUiPalette.fg);
         tableSprite->setCursor(74, yPos);
         String callText = potaSpots[i].callsign;
-        if (callText.length() > 8) callText = callText.substring(0, 8);
+        if (callText.length() > 9) callText = callText.substring(0, 9);
         tableSprite->print(callText);
 
-        tableSprite->setTextColor(TFT_YELLOW);
-        tableSprite->setCursor(204, yPos);
+        tableSprite->setTextColor(tftTableFreqColor());
+        tableSprite->setCursor(191, yPos);
         tableSprite->print(potaSpots[i].frequency, 3);
 
-        tableSprite->setTextColor(TFT_GREEN);
-        tableSprite->setCursor(282, yPos);
+        tableSprite->setTextColor(tftTableModeColor());
+        tableSprite->setCursor(274, yPos);
         String modeText = potaSpots[i].mode;
         if (modeText.length() > 4) modeText = modeText.substring(0, 4);
         tableSprite->print(modeText);
@@ -2688,12 +5377,12 @@ void updateScreen7Data() {
         yPos += 27;
       } else {
         if (displayCount % 2 == 0) {
-          tableSprite->fillRect(0, yPos - 2, 320, 16, TFT_TABLE_ALT_ROW_COLOR);
+          tableSprite->fillRect(0, yPos - 2, 320, 16, tftUiPalette.rowAlt);
         }
 
         tableSprite->setTextSize(1);
 
-        tableSprite->setTextColor(TFT_LIGHTGREY);
+        tableSprite->setTextColor(tftUiPalette.muted);
         tableSprite->setCursor(5, yPos);
         String timeStr = potaSpots[i].time;
         int tPos = timeStr.indexOf('T');
@@ -2703,20 +5392,20 @@ void updateScreen7Data() {
         if (timeStr.length() > 5) timeStr = timeStr.substring(0, 5);
         tableSprite->print(timeStr);
 
-        tableSprite->setTextColor(TFT_WHITE);
+        tableSprite->setTextColor(tftUiPalette.fg);
         tableSprite->setCursor(50, yPos);
         tableSprite->print(potaSpots[i].callsign);
 
-        tableSprite->setTextColor(TFT_YELLOW);
+        tableSprite->setTextColor(tftTableFreqColor());
         tableSprite->setCursor(125, yPos);
         tableSprite->print(potaSpots[i].frequency, 3);
 
-        tableSprite->setTextColor(TFT_GREEN);
-        tableSprite->setCursor(190, yPos);
+        tableSprite->setTextColor(tftTableModeColor());
+        tableSprite->setCursor(182, yPos);
         tableSprite->print(potaSpots[i].mode);
 
-        tableSprite->setTextColor(TFT_RADIO_ORANGE);
-        tableSprite->setCursor(220, yPos);
+        tableSprite->setTextColor(tftTableAccentTextColor());
+        tableSprite->setCursor(212, yPos);
         String countryText = formatDistanceOrCountry(potaSpots[i], COUNTRY_COL_MAX_LEN);
         tableSprite->print(countryText);
 
@@ -2724,6 +5413,7 @@ void updateScreen7Data() {
       }
       displayCount++;
     }
+    unlockPotaSpots();
 
     if (displayCount == 0) {
       tableSprite->setTextColor(TFT_RED);
@@ -2737,27 +5427,28 @@ void updateScreen7Data() {
   }
 
   // Fallback bez sprite (np. gdy zabraknie RAM)
-  tft.fillRect(0, tableTop, 320, tableHeight, TFT_BLACK);
+  tft.fillRect(0, tableTop, 320, tableHeight, tftUiPalette.bg);
 
   int yPos = 40;
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(tftUiPalette.muted);
   tft.setTextSize(1);
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(204, yPos); tft.print("MHz");
-    tft.setCursor(282, yPos); tft.print("MODE");
+    tft.setCursor(191, yPos); tft.print("MHz");
+    tft.setCursor(274, yPos); tft.print("MODE");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("MHz");
-    tft.setCursor(190, yPos); tft.print("MODE");
-    tft.setCursor(220, yPos); tft.print(tr(TR_COUNTRY));
+    tft.setCursor(182, yPos); tft.print("MODE");
+    tft.setCursor(212, yPos); tft.print(tr(TR_COUNTRY));
   }
-  tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
+  tft.drawFastHLine(0, yPos + 10, 320, tftUiPalette.muted);
   yPos += enlarged ? 20 : 18;
 
   int displayCount = 0;
+  lockPotaSpots();
   for (int i = 0; i < potaSpotCount && displayCount < maxRows; i++) {
     if (!spotMatchesScreen7Filters(potaSpots[i])) continue;
     if (yPos >= (tableBottom - 2)) {
@@ -2765,27 +5456,27 @@ void updateScreen7Data() {
     }
     if (enlarged) {
       if (displayCount % 2 == 0) {
-        tft.fillRect(0, yPos - 5, 320, 24, TFT_TABLE_ALT_ROW_COLOR);
+        tft.fillRect(0, yPos - 5, 320, 24, tftUiPalette.rowAlt);
       }
 
       tft.setTextSize(2);
 
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       tft.print(formatSpotUtc(potaSpots[i].time));
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(74, yPos);
       String callText = potaSpots[i].callsign;
-      if (callText.length() > 8) callText = callText.substring(0, 8);
+      if (callText.length() > 9) callText = callText.substring(0, 9);
       tft.print(callText);
 
-      tft.setTextColor(TFT_YELLOW);
-      tft.setCursor(204, yPos);
+      tft.setTextColor(tftTableFreqColor());
+      tft.setCursor(191, yPos);
       tft.print(potaSpots[i].frequency, 3);
 
-      tft.setTextColor(TFT_GREEN);
-      tft.setCursor(282, yPos);
+      tft.setTextColor(tftTableModeColor());
+      tft.setCursor(274, yPos);
       String modeText = potaSpots[i].mode;
       if (modeText.length() > 4) modeText = modeText.substring(0, 4);
       tft.print(modeText);
@@ -2793,12 +5484,12 @@ void updateScreen7Data() {
       yPos += 27;
     } else {
       if (displayCount % 2 == 0) {
-        tft.fillRect(0, yPos - 2, 320, 16, TFT_TABLE_ALT_ROW_COLOR);
+        tft.fillRect(0, yPos - 2, 320, 16, tftUiPalette.rowAlt);
       }
 
       tft.setTextSize(1);
 
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       String timeStr = potaSpots[i].time;
       int tPos = timeStr.indexOf('T');
@@ -2808,20 +5499,20 @@ void updateScreen7Data() {
       if (timeStr.length() > 5) timeStr = timeStr.substring(0, 5);
       tft.print(timeStr);
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(50, yPos);
       tft.print(potaSpots[i].callsign);
 
-      tft.setTextColor(TFT_YELLOW);
+      tft.setTextColor(tftTableFreqColor());
       tft.setCursor(125, yPos);
       tft.print(potaSpots[i].frequency, 3);
 
-      tft.setTextColor(TFT_GREEN);
-      tft.setCursor(190, yPos);
+      tft.setTextColor(tftTableModeColor());
+      tft.setCursor(182, yPos);
       tft.print(potaSpots[i].mode);
 
-      tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(220, yPos);
+      tft.setTextColor(tftTableAccentTextColor());
+      tft.setCursor(212, yPos);
       String countryText = formatDistanceOrCountry(potaSpots[i], COUNTRY_COL_MAX_LEN);
       tft.print(countryText);
 
@@ -2829,6 +5520,7 @@ void updateScreen7Data() {
     }
     displayCount++;
   }
+  unlockPotaSpots();
 
   if (displayCount == 0) {
     tft.setTextColor(TFT_RED);
@@ -2864,10 +5556,10 @@ static String formatHamalertTftTime(const String &rawTime) {
 }
 
 void drawHamalertCluster() {
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(tftUiPalette.bg);
 
-  tft.fillRect(0, 0, 320, 32, TFT_RADIO_ORANGE);
-  tft.setTextColor(TFT_BLACK);
+  tft.fillRect(0, 0, 320, 32, tftHeaderBgColor());
+  tft.setTextColor(tftHeaderTextColor());
 
   drawHamburgerMenuButton3D(5, 7);
 
@@ -2886,52 +5578,53 @@ void drawHamalertCluster() {
 
   int yPos = 40;
   const bool enlarged = isDxTableEnlarged();
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(tftUiPalette.muted);
   tft.setTextSize(1);
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(204, yPos); tft.print("MHz");
-    tft.setCursor(282, yPos); tft.print("MODE");
+    tft.setCursor(191, yPos); tft.print("MHz");
+    tft.setCursor(274, yPos); tft.print("MODE");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("MHz");
-    tft.setCursor(190, yPos); tft.print("MODE");
-    tft.setCursor(220, yPos); tft.print(tr(TR_COUNTRY));
+    tft.setCursor(182, yPos); tft.print("MODE");
+    tft.setCursor(212, yPos); tft.print(tr(TR_COUNTRY));
   }
-  tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
+  tft.drawFastHLine(0, yPos + 10, 320, tftUiPalette.muted);
   yPos += enlarged ? 20 : 18;
 
   const int maxRows = getHamalertTableMaxRows();
   int displayCount = 0;
+  lockHamalertSpots();
   for (int i = 0; i < hamalertSpotCount && displayCount < maxRows; i++) {
     if (!spotMatchesScreen8Filters(hamalertSpots[i])) {
       continue;
     }
     if (enlarged) {
       if (displayCount % 2 == 0) {
-        tft.fillRect(0, yPos - 5, 320, 24, TFT_TABLE_ALT_ROW_COLOR);
+        tft.fillRect(0, yPos - 5, 320, 24, tftUiPalette.rowAlt);
       }
 
       tft.setTextSize(2);
 
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       tft.print(formatHamalertTftTime(hamalertSpots[i].time));
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(74, yPos);
       String callText = hamalertSpots[i].callsign;
-      if (callText.length() > 8) callText = callText.substring(0, 8);
+      if (callText.length() > 9) callText = callText.substring(0, 9);
       tft.print(callText);
 
-      tft.setTextColor(TFT_YELLOW);
-      tft.setCursor(204, yPos);
+      tft.setTextColor(tftTableFreqColor());
+      tft.setCursor(191, yPos);
       tft.print(hamalertSpots[i].frequency, 3);
 
-      tft.setTextColor(TFT_GREEN);
-      tft.setCursor(282, yPos);
+      tft.setTextColor(tftTableModeColor());
+      tft.setCursor(274, yPos);
       String modeText = hamalertSpots[i].mode;
       if (modeText.length() > 4) modeText = modeText.substring(0, 4);
       tft.print(modeText);
@@ -2939,29 +5632,29 @@ void drawHamalertCluster() {
       yPos += 27;
     } else {
       if (displayCount % 2 == 0) {
-        tft.fillRect(0, yPos - 2, 320, 16, TFT_TABLE_ALT_ROW_COLOR);
+        tft.fillRect(0, yPos - 2, 320, 16, tftUiPalette.rowAlt);
       }
 
       tft.setTextSize(1);
 
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       tft.print(formatHamalertTftTime(hamalertSpots[i].time));
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(50, yPos);
       tft.print(hamalertSpots[i].callsign);
 
-      tft.setTextColor(TFT_YELLOW);
+      tft.setTextColor(tftTableFreqColor());
       tft.setCursor(125, yPos);
       tft.print(hamalertSpots[i].frequency, 3);
 
-      tft.setTextColor(TFT_GREEN);
-      tft.setCursor(190, yPos);
+      tft.setTextColor(tftTableModeColor());
+      tft.setCursor(182, yPos);
       tft.print(hamalertSpots[i].mode);
 
-      tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(220, yPos);
+      tft.setTextColor(tftTableAccentTextColor());
+      tft.setCursor(212, yPos);
       String countryText = formatDistanceOrCountry(hamalertSpots[i], COUNTRY_COL_MAX_LEN);
       tft.print(countryText);
 
@@ -2969,6 +5662,7 @@ void drawHamalertCluster() {
     }
     displayCount++;
   }
+  unlockHamalertSpots();
 
   if (displayCount == 0) {
     tft.setTextColor(TFT_RED);
@@ -2993,8 +5687,8 @@ void updateScreen8Clock() {
   int timeWidth = strlen(timeBuffer) * 12;
   int timeX = 315 - timeWidth;
 
-  tft.fillRect(timeX - 2, 4, timeWidth + 6, 24, TFT_RADIO_ORANGE);
-  tft.setTextColor(TFT_BLACK);
+  tft.fillRect(timeX - 2, 4, timeWidth + 6, 24, tftHeaderBgColor());
+  tft.setTextColor(tftHeaderTextColor());
   tft.setTextSize(2);
   tft.setCursor(timeX, 8);
   tft.print(timeBuffer);
@@ -3004,11 +5698,12 @@ uint32_t computeScreen8Signature() {
   const uint32_t fnvPrime = 16777619u;
   uint32_t hash = 2166136261u;
 
+  lockHamalertSpots();
   hash ^= (uint32_t)hamalertSpotCount;
   hash *= fnvPrime;
-  hash ^= (uint32_t)screen8FilterMode;
+  hash ^= (uint32_t)screen8FilterModeMask;
   hash *= fnvPrime;
-  hash ^= (uint32_t)screen8FilterBandIndex;
+  hash ^= (uint32_t)screen8FilterBandMask;
   hash *= fnvPrime;
   hash ^= (uint32_t)dxTableSizeMode;
   hash *= fnvPrime;
@@ -3042,6 +5737,7 @@ uint32_t computeScreen8Signature() {
     }
     displayCount++;
   }
+  unlockHamalertSpots();
 
   return hash;
 }
@@ -3066,27 +5762,28 @@ void updateScreen8Data() {
   const int tableBottom = getTableBottomForScreen(SCREEN_HAMALERT_CLUSTER);
   const int tableHeight = tableBottom - tableTop;
 
-  tft.fillRect(0, tableTop, 320, tableHeight, TFT_BLACK);
+  tft.fillRect(0, tableTop, 320, tableHeight, tftUiPalette.bg);
 
   int yPos = 40;
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(tftUiPalette.muted);
   tft.setTextSize(1);
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(204, yPos); tft.print("MHz");
-    tft.setCursor(282, yPos); tft.print("MODE");
+    tft.setCursor(191, yPos); tft.print("MHz");
+    tft.setCursor(274, yPos); tft.print("MODE");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("MHz");
-    tft.setCursor(190, yPos); tft.print("MODE");
-    tft.setCursor(220, yPos); tft.print(tr(TR_COUNTRY));
+    tft.setCursor(182, yPos); tft.print("MODE");
+    tft.setCursor(212, yPos); tft.print(tr(TR_COUNTRY));
   }
-  tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
+  tft.drawFastHLine(0, yPos + 10, 320, tftUiPalette.muted);
   yPos += enlarged ? 20 : 18;
 
   int displayCount = 0;
+  lockHamalertSpots();
   for (int i = 0; i < hamalertSpotCount && displayCount < maxRows; i++) {
     if (!spotMatchesScreen8Filters(hamalertSpots[i])) {
       continue;
@@ -3096,27 +5793,27 @@ void updateScreen8Data() {
     }
     if (enlarged) {
       if (displayCount % 2 == 0) {
-        tft.fillRect(0, yPos - 5, 320, 24, TFT_TABLE_ALT_ROW_COLOR);
+        tft.fillRect(0, yPos - 5, 320, 24, tftUiPalette.rowAlt);
       }
 
       tft.setTextSize(2);
 
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       tft.print(formatHamalertTftTime(hamalertSpots[i].time));
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(74, yPos);
       String callText = hamalertSpots[i].callsign;
-      if (callText.length() > 8) callText = callText.substring(0, 8);
+      if (callText.length() > 9) callText = callText.substring(0, 9);
       tft.print(callText);
 
-      tft.setTextColor(TFT_YELLOW);
-      tft.setCursor(204, yPos);
+      tft.setTextColor(tftTableFreqColor());
+      tft.setCursor(191, yPos);
       tft.print(hamalertSpots[i].frequency, 3);
 
-      tft.setTextColor(TFT_GREEN);
-      tft.setCursor(282, yPos);
+      tft.setTextColor(tftTableModeColor());
+      tft.setCursor(274, yPos);
       String modeText = hamalertSpots[i].mode;
       if (modeText.length() > 4) modeText = modeText.substring(0, 4);
       tft.print(modeText);
@@ -3124,29 +5821,29 @@ void updateScreen8Data() {
       yPos += 27;
     } else {
       if (displayCount % 2 == 0) {
-        tft.fillRect(0, yPos - 2, 320, 16, TFT_TABLE_ALT_ROW_COLOR);
+        tft.fillRect(0, yPos - 2, 320, 16, tftUiPalette.rowAlt);
       }
 
       tft.setTextSize(1);
 
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       tft.print(formatHamalertTftTime(hamalertSpots[i].time));
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(50, yPos);
       tft.print(hamalertSpots[i].callsign);
 
-      tft.setTextColor(TFT_YELLOW);
+      tft.setTextColor(tftTableFreqColor());
       tft.setCursor(125, yPos);
       tft.print(hamalertSpots[i].frequency, 3);
 
-      tft.setTextColor(TFT_GREEN);
-      tft.setCursor(190, yPos);
+      tft.setTextColor(tftTableModeColor());
+      tft.setCursor(182, yPos);
       tft.print(hamalertSpots[i].mode);
 
-      tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(220, yPos);
+      tft.setTextColor(tftTableAccentTextColor());
+      tft.setCursor(212, yPos);
       String countryText = formatDistanceOrCountry(hamalertSpots[i], COUNTRY_COL_MAX_LEN);
       tft.print(countryText);
 
@@ -3154,6 +5851,7 @@ void updateScreen8Data() {
     }
     displayCount++;
   }
+  unlockHamalertSpots();
 
   if (displayCount == 0) {
     tft.setTextColor(TFT_RED);
@@ -3226,6 +5924,7 @@ ScreenType normalizeScreenType(uint8_t raw) {
     case SCREEN_BAND_INFO:
     case SCREEN_WEATHER_DSP:
     case SCREEN_WEATHER_FORECAST:
+    case SCREEN_LOKALIZACJA:
     case SCREEN_APRS_IS:
     case SCREEN_APRS_RADAR:
     case SCREEN_POTA_CLUSTER:
@@ -3248,6 +5947,7 @@ const char* screenTypeToCodeStr(ScreenType t) {
     case SCREEN_SUN_SPOTS: return "sunspots";
     case SCREEN_WEATHER_DSP: return "weather";
     case SCREEN_WEATHER_FORECAST: return "weatherforecast";
+    case SCREEN_LOKALIZACJA: return "lokalizacja";
     case SCREEN_POTA_CLUSTER: return "pota";
     case SCREEN_HAMALERT_CLUSTER: return "hamalert";
     case SCREEN_MATRIX_CLOCK: return "matrix";
@@ -3270,6 +5970,7 @@ ScreenType screenCodeToType(const String &code) {
   if (c == "sunspots") return SCREEN_SUN_SPOTS;
   if (c == "weather") return SCREEN_WEATHER_DSP;
   if (c == "weatherforecast" || c == "forecast") return SCREEN_WEATHER_FORECAST;
+  if (c == "lokalizacja" || c == "location" || c == "gps") return SCREEN_LOKALIZACJA;
   if (c == "pota") return SCREEN_POTA_CLUSTER;
   if (c == "hamalert") return SCREEN_HAMALERT_CLUSTER;
   if (c == "matrix") return SCREEN_MATRIX_CLOCK;
@@ -3285,12 +5986,12 @@ void loadDefaultScreenOrder() {
 
 void ensureScreenOrderValid() {
   bool hasActive = false;
-  bool seen[13] = {false}; // indeksy odpowiadają ScreenType wartościom (0..12)
+  bool seen[14] = {false}; // indeksy odpowiadają ScreenType wartościom (0..13)
   for (int i = 0; i < SCREEN_ORDER_COUNT; i++) {
     screenOrder[i] = normalizeScreenType(screenOrder[i]);
     ScreenType t = screenOrder[i];
     if (t != SCREEN_OFF) {
-      if (t >= 0 && t <= SCREEN_WEATHER_FORECAST) {
+      if (t >= 0 && t <= SCREEN_LOKALIZACJA) {
         if (seen[t]) {
           // drugi raz ten sam ekran – usuń duplikat
           screenOrder[i] = SCREEN_OFF;
@@ -3432,6 +6133,7 @@ void handleTouchNavigation() {
         brightnessMenuPrevInMenu = inMenu;
         brightnessMenuPrevBacklight = backlightPercent;
         brightnessMenuPrevThemeHue = menuThemeHue;
+        brightnessMenuPrevStyleMode = tftStyleMode;
         brightnessMenuActive = true;
         brightnessMenuValue = backlightPercent;
         brightnessMenuOpenedMs = now;
@@ -3574,6 +6276,26 @@ void handleTouchNavigation() {
       }
     }
 
+    if (currentScreen == SCREEN_LOKALIZACJA) {
+      if (isLokalizacjaSaveButtonHit(x, y)) {
+        unsigned long nowGps = millis();
+        bool gpsReadyToSave = isGpsUartActive(nowGps) && isGpsFixActive(nowGps) && gpsLocationValid;
+        if (gpsReadyToSave) {
+          userLat = gpsLatitude;
+          userLon = gpsLongitude;
+          userLatLonValid = true;
+          savePreferences();
+          Serial.printf("[GPS] Zapisano pozycje stacji z GPS: LAT=%.6f LON=%.6f\n", userLat, userLon);
+        } else {
+          Serial.println("[GPS] Nie zapisano pozycji: wymagany aktywny GPS + FIX + poprawne LAT/LON");
+        }
+        drawLokalizacja();
+        resetTftAutoSwitchTimer();
+        autoswitchPausedUntilMs = 0;
+        return;
+      }
+    }
+
     // Nawigacja: dolne obszary dotyku (ok. 80x180)
     const uint16_t cornerY = 60;
     const uint16_t cornerX = 80;
@@ -3581,12 +6303,18 @@ void handleTouchNavigation() {
       currentScreen = getPrevScreenId(currentScreen);
       drawScreen(currentScreen);
       resetTftAutoSwitchTimer();
+      autoswitchPausedUntilMs = 0;
       LOGV_PRINTF("[TOUCH] Ekran zmieniony na: %d (tap left)\n", currentScreen);
     } else if (y >= cornerY && x >= (320 - cornerX)) {
       currentScreen = getNextScreenId(currentScreen);
       drawScreen(currentScreen);
       resetTftAutoSwitchTimer();
+      autoswitchPausedUntilMs = 0;
       LOGV_PRINTF("[TOUCH] Ekran zmieniony na: %d (tap right)\n", currentScreen);
+    } else if (y >= cornerY && x >= cornerX && x < (320 - cornerX)) {
+      // środek ekranu: pauzuj autoswitch na 10 sekund
+      autoswitchPausedUntilMs = millis() + 10000UL;
+      LOGV_PRINTF("[TOUCH] Autoswitch zapauzowany na 10s (tap center)\n");
     }
   } else {
     touchActive = false;
@@ -3601,11 +6329,11 @@ void handleTouchNavigation() {
 }
 // Ekran 2: DX Cluster
 void drawDxCluster() {
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(tftUiPalette.bg);
 
   // 1. NAGĹĂ“WEK: Belka z menu, nazwÄ… klastra i czasem UTC
-  tft.fillRect(0, 0, 320, 32, TFT_RADIO_ORANGE);
-  tft.setTextColor(TFT_BLACK);
+  tft.fillRect(0, 0, 320, 32, tftHeaderBgColor());
+  tft.setTextColor(tftHeaderTextColor());
 
 // IKONA MENU (3D)
 drawHamburgerMenuButton3D(5, 7);
@@ -3627,22 +6355,22 @@ tft.print(clusterHost);
   // 2. NAGĹĂ“WKI TABELI
   const bool enlarged = isDxTableEnlarged();
   int yPos = 40;
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(tftUiPalette.muted);
   tft.setTextSize(1);
 
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(204, yPos); tft.print("MHz");
-    tft.setCursor(282, yPos); tft.print("MODE");
+    tft.setCursor(191, yPos); tft.print("MHz");
+    tft.setCursor(274, yPos); tft.print("MODE");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("MHz");
-    tft.setCursor(190, yPos); tft.print("MODE");
-    tft.setCursor(220, yPos); tft.print(tr(TR_COUNTRY));
+    tft.setCursor(182, yPos); tft.print("MODE");
+    tft.setCursor(212, yPos); tft.print(tr(TR_COUNTRY));
   }
-  tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
+  tft.drawFastHLine(0, yPos + 10, 320, tftUiPalette.muted);
   yPos += enlarged ? 20 : 18;
 
   // 3. LISTA SPOTĂ“W
@@ -3654,50 +6382,50 @@ tft.print(clusterHost);
       continue;
     }
     if (enlarged) {
-      if (displayCount % 2 == 0) tft.fillRect(0, yPos - 5, 320, 24, TFT_TABLE_ALT_ROW_COLOR);
+      if (displayCount % 2 == 0) tft.fillRect(0, yPos - 5, 320, 24, tftUiPalette.rowAlt);
       tft.setTextSize(2);
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       tft.print(formatSpotUtc(spots[i].time));
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(74, yPos);
       String callText = spots[i].callsign;
-      if (callText.length() > 8) callText = callText.substring(0, 8);
+      if (callText.length() > 9) callText = callText.substring(0, 9);
       tft.print(callText);
 
-      tft.setTextColor(TFT_YELLOW);
-      tft.setCursor(204, yPos);
+      tft.setTextColor(tftTableFreqColor());
+      tft.setCursor(191, yPos);
       tft.print(spots[i].frequency / 1000.0, 3);
 
-      tft.setTextColor(TFT_GREEN);
-      tft.setCursor(282, yPos);
+      tft.setTextColor(tftTableModeColor());
+      tft.setCursor(274, yPos);
       String modeText = spots[i].mode;
       if (modeText.length() > 4) modeText = modeText.substring(0, 4);
       tft.print(modeText);
       yPos += 27;
     } else {
-      if (displayCount % 2 == 0) tft.fillRect(0, yPos - 2, 320, 16, TFT_TABLE_ALT_ROW_COLOR);
+      if (displayCount % 2 == 0) tft.fillRect(0, yPos - 2, 320, 16, tftUiPalette.rowAlt);
 
       tft.setTextSize(1);
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       tft.print(formatSpotUtc(spots[i].time));
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(50, yPos);
       tft.print(spots[i].callsign);
 
-      tft.setTextColor(TFT_YELLOW);
+      tft.setTextColor(tftTableFreqColor());
       tft.setCursor(125, yPos);
       tft.print(spots[i].frequency / 1000.0, 3);
 
-      tft.setTextColor(TFT_GREEN);
-      tft.setCursor(190, yPos);
+      tft.setTextColor(tftTableModeColor());
+      tft.setCursor(182, yPos);
       tft.print(spots[i].mode);
 
-      tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(220, yPos);
+      tft.setTextColor(tftTableAccentTextColor());
+      tft.setCursor(212, yPos);
       String countryText = formatDistanceOrCountry(spots[i], COUNTRY_COL_MAX_LEN);
       tft.print(countryText);
 
@@ -3717,10 +6445,6 @@ tft.print(clusterHost);
     tft.setTextSize(2);
     tft.setCursor(40, 120);
     tft.print("WAITING FOR SPOTS...");
-  }
-
-  if (isTableNavFooterVisible(SCREEN_HAMALERT_CLUSTER)) {
-    drawSwitchScreenFooter();
   }
 }
 
@@ -3813,6 +6537,11 @@ static void drawScreen6RadarZoomHints() {
     return;
   }
 
+  const bool lightTheme = isTftStyleLight();
+  const uint16_t radarBgColor = lightTheme ? TFT_WHITE : TFT_BLACK;
+  const uint16_t radarTextColor = lightTheme ? tftUiPalette.fg : TFT_LIGHTGREY;
+  const uint16_t hintTextColor = lightTheme ? TFT_NAVY : TFT_YELLOW;
+
   const int screenW = tft.width();
   const int screenH = tft.height();
   const char *topHint = "ZOOM +";
@@ -3821,7 +6550,7 @@ static void drawScreen6RadarZoomHints() {
   const int bottomW = (int)strlen(bottomHint) * 12;
 
   tft.setTextSize(2);
-  tft.setTextColor(TFT_YELLOW);
+  tft.setTextColor(hintTextColor);
   tft.setCursor((screenW - topW) / 2, 6);
   tft.print(topHint);
   tft.setCursor((screenW - bottomW) / 2, screenH - 20);
@@ -3848,11 +6577,11 @@ static void drawScreen6RadarZoomHints() {
   int rmaxW = (int)rmaxInfo.length() * 6;
   int alertW = (int)alertInfo.length() * 6;
 
-  tft.fillRect(infoX - 1, zoomY - 1, zoomW + 2, 10, TFT_BLACK);
-  tft.fillRect(infoX - 1, rmaxY - 1, rmaxW + 2, 10, TFT_BLACK);
-  tft.fillRect(infoX - 1, alertY - 1, alertW + 2, 10, TFT_BLACK);
+  tft.fillRect(infoX - 1, zoomY - 1, zoomW + 2, 10, radarBgColor);
+  tft.fillRect(infoX - 1, rmaxY - 1, rmaxW + 2, 10, radarBgColor);
+  tft.fillRect(infoX - 1, alertY - 1, alertW + 2, 10, radarBgColor);
 
-  tft.setTextColor(TFT_LIGHTGREY);
+  tft.setTextColor(radarTextColor);
   tft.setCursor(infoX, zoomY);
   tft.print(zoomInfo);
 
@@ -3866,16 +6595,25 @@ static void drawScreen6RadarZoomHints() {
 
 static uint16_t getAprsRadarColorForStation(const APRSStation &station) {
   String symbolShort = getAPRSSymbolShort(station);
+  if (isTftStyleLight()) {
+    return (symbolShort == "CAR") ? TFT_RED : TFT_BLACK;
+  }
   if (symbolShort == "CAR") return TFT_RED;
   if (symbolShort == "HOUSE") return TFT_YELLOW;
-  if (symbolShort == "HUMAN") return TFT_BLUE;
+  if (symbolShort == "HUMAN") return 0x3C1F;
+  if (symbolShort == "HAMCLOCK") return TFT_ORANGE;
   return TFT_GREEN;
 }
 
 static void drawAprsRadarBody() {
   const int screenW = tft.width();
   const int screenH = tft.height();
-  tft.fillRect(0, 0, screenW, screenH, TFT_BLACK);
+  const bool lightTheme = isTftStyleLight();
+  const uint16_t radarBgColor = lightTheme ? TFT_WHITE : TFT_BLACK;
+  const uint16_t radarMainRingColor = lightTheme ? TFT_BLACK : TFT_WHITE;
+  const uint16_t radarTextColor = lightTheme ? tftUiPalette.fg : TFT_LIGHTGREY;
+  const uint16_t crossColor = lightTheme ? TFT_DARKGREY : 0x39C7;
+  tft.fillRect(0, 0, screenW, screenH, radarBgColor);
 
   const int centerX = screenW / 2;
   const int centerY = screenH / 2;
@@ -3899,7 +6637,7 @@ static void drawAprsRadarBody() {
                               ? ((float)aprsFilterRadius / zoomSafe)
                               : 0.0f;
 
-  const uint16_t radarCircleBgColor = TFT_BLACK;
+  const uint16_t radarCircleBgColor = radarBgColor;
   const uint16_t radarAlertColor = rgb565(70, 130, 190);
   const uint16_t ringColor = TFT_DARKGREY;
   const int innerRadius = (aprsFilterRadius > 0)
@@ -3916,11 +6654,11 @@ static void drawAprsRadarBody() {
   tft.drawCircle(centerX, centerY, fixedHalfRadius, ringColor);  // 50%
 
   // Oryginalne okręgi radaru
-  tft.drawCircle(centerX, centerY, outerRadius, TFT_WHITE);
+  tft.drawCircle(centerX, centerY, outerRadius, radarMainRingColor);
   tft.drawCircle(centerX, centerY, clampedInnerRadius, radarAlertColor);
 
-  tft.drawFastVLine(centerX, centerY - outerRadius, outerRadius * 2, 0x39C7);
-  tft.drawFastHLine(centerX - outerRadius, centerY, outerRadius * 2, 0x39C7);
+  tft.drawFastVLine(centerX, centerY - outerRadius, outerRadius * 2, crossColor);
+  tft.drawFastHLine(centerX - outerRadius, centerY, outerRadius * 2, crossColor);
 
   auto kmLabel = [](float km) -> String {
     if (km >= 100.0f) return String((int)(km + 0.5f)) + "km";
@@ -3929,7 +6667,7 @@ static void drawAprsRadarBody() {
   };
 
   tft.setTextSize(1);
-  tft.setTextColor(TFT_LIGHTGREY);
+  tft.setTextColor(radarTextColor);
   String ring100Text = kmLabel(fixedOuterKm);
   String ring50Text = kmLabel(fixedOuterKm * 0.5f);
 
@@ -3937,8 +6675,8 @@ static void drawAprsRadarBody() {
   int ring100Y = max(0, centerY - fixedOuterRadius + 2);
   int ring50Y = max(0, centerY - fixedHalfRadius + 2);
 
-  tft.fillRect(ringLabelX - 1, ring100Y - 1, (int)ring100Text.length() * 6 + 2, 10, TFT_BLACK);
-  tft.fillRect(ringLabelX - 1, ring50Y - 1, (int)ring50Text.length() * 6 + 2, 10, TFT_BLACK);
+  tft.fillRect(ringLabelX - 1, ring100Y - 1, (int)ring100Text.length() * 6 + 2, 10, radarCircleBgColor);
+  tft.fillRect(ringLabelX - 1, ring50Y - 1, (int)ring50Text.length() * 6 + 2, 10, radarCircleBgColor);
   tft.setCursor(ringLabelX, ring100Y);
   tft.print(ring100Text);
   tft.setCursor(ringLabelX, ring50Y);
@@ -3960,7 +6698,12 @@ static void drawAprsRadarBody() {
       continue;
     }
 
-    float bearingDeg = calculateBearing(userLat, userLon, (double)station.lat, (double)station.lon);
+    double radarUserLat = 0.0;
+    double radarUserLon = 0.0;
+    if (!getServiceCoordinatesForServices(radarUserLat, radarUserLon)) {
+      continue;
+    }
+    float bearingDeg = calculateBearing(radarUserLat, radarUserLon, (double)station.lat, (double)station.lon);
     float angleRad = bearingDeg * (float)M_PI / 180.0f;
     float scaledRadius = (station.distance / (float)aprsFilterRadius) * outerRadius;
     if (scaledRadius > outerRadius) {
@@ -3983,7 +6726,8 @@ static void drawAprsRadarBody() {
     if (ty < 2) ty = py + 6;
     if (ty > screenH - 9) ty = screenH - 9;
 
-    tft.setTextColor(color);
+    uint16_t labelColor = lightTheme ? TFT_NAVY : color;
+    tft.setTextColor(labelColor);
     tft.setTextSize(1);
     tft.setCursor(tx, ty);
     tft.print(call);
@@ -4041,10 +6785,10 @@ void drawDxClusterFilterMenu() {
   const int modeGap = 6;
   const int modeStartX = (320 - (4 * modeTileW + 3 * modeGap)) / 2;
   const int modeY = 40;
-  drawFilterTile(modeStartX + 0 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "ALL", screen2FilterMode == FILTER_MODE_ALL);
-  drawFilterTile(modeStartX + 1 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "CW", screen2FilterMode == FILTER_MODE_CW);
-  drawFilterTile(modeStartX + 2 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "SSB", screen2FilterMode == FILTER_MODE_SSB);
-  drawFilterTile(modeStartX + 3 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "DIGI", screen2FilterMode == FILTER_MODE_DIGI);
+  drawFilterTile(modeStartX + 0 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "ALL", isModeFilterTileSelected(screen2FilterModeMask, FILTER_MODE_ALL));
+  drawFilterTile(modeStartX + 1 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "CW", isModeFilterTileSelected(screen2FilterModeMask, FILTER_MODE_CW));
+  drawFilterTile(modeStartX + 2 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "SSB", isModeFilterTileSelected(screen2FilterModeMask, FILTER_MODE_SSB));
+  drawFilterTile(modeStartX + 3 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "DIGI", isModeFilterTileSelected(screen2FilterModeMask, FILTER_MODE_DIGI));
 
   tft.setTextColor(TFT_LIGHTGREY);
   tft.setCursor(10, 82);
@@ -4061,7 +6805,7 @@ void drawDxClusterFilterMenu() {
       if (bandIdx >= SCREEN8_FILTER_BANDS_COUNT) break;
       int x = bandStartX + col * (bandTileW + bandGap);
       int y = bandStartY + row * (bandTileH + bandGap);
-      drawFilterTile(x, y, bandTileW, bandTileH, SCREEN8_FILTER_BANDS[bandIdx], screen2FilterBandIndex == bandIdx);
+      drawFilterTile(x, y, bandTileW, bandTileH, SCREEN8_FILTER_BANDS[bandIdx], isBandFilterTileSelected(screen2FilterBandMask, bandIdx));
       bandIdx++;
     }
   }
@@ -4083,7 +6827,7 @@ void handleScreen2MenuTouch(uint16_t x, uint16_t y) {
   for (int i = 0; i < 4; i++) {
     int rx = modeStartX + i * (modeTileW + modeGap);
     if (isPointInRect(x, y, rx, modeY, modeTileW, modeTileH)) {
-      screen2FilterMode = (Screen2FilterMode)i;
+      toggleModeFilterSelection(screen2FilterModeMask, i);
       drawDxClusterFilterMenu();
       return;
     }
@@ -4101,7 +6845,7 @@ void handleScreen2MenuTouch(uint16_t x, uint16_t y) {
       int rx = bandStartX + col * (bandTileW + bandGap);
       int ry = bandStartY + row * (bandTileH + bandGap);
       if (isPointInRect(x, y, rx, ry, bandTileW, bandTileH)) {
-        screen2FilterBandIndex = bandIdx;
+        toggleBandFilterSelection(screen2FilterBandMask, bandIdx);
         drawDxClusterFilterMenu();
         return;
       }
@@ -4114,6 +6858,7 @@ void handleScreen2MenuTouch(uint16_t x, uint16_t y) {
   const int closeX = (320 - closeW) / 2;
   const int closeY = 210;
   if (isPointInRect(x, y, closeX, closeY, closeW, closeH)) {
+    savePreferences();
     inMenu = false;
     drawScreen(SCREEN_DX_CLUSTER);
     return;
@@ -4216,6 +6961,7 @@ void handleScreen6MenuTouch(uint16_t x, uint16_t y) {
   const int saveX = 166;
   const int closeY = 210;
   if (isPointInRect(x, y, closeX, closeY, closeW, closeH)) {
+    savePreferences();
     inMenu = false;
     drawScreen(currentScreen);
     return;
@@ -4250,10 +6996,10 @@ void drawPotaFilterMenu() {
   const int modeGap = 6;
   const int modeStartX = (320 - (4 * modeTileW + 3 * modeGap)) / 2;
   const int modeY = 40;
-  drawFilterTile(modeStartX + 0 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "ALL", screen7FilterMode == FILTER_MODE_ALL);
-  drawFilterTile(modeStartX + 1 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "CW", screen7FilterMode == FILTER_MODE_CW);
-  drawFilterTile(modeStartX + 2 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "SSB", screen7FilterMode == FILTER_MODE_SSB);
-  drawFilterTile(modeStartX + 3 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "DIGI", screen7FilterMode == FILTER_MODE_DIGI);
+  drawFilterTile(modeStartX + 0 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "ALL", isModeFilterTileSelected(screen7FilterModeMask, FILTER_MODE_ALL));
+  drawFilterTile(modeStartX + 1 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "CW", isModeFilterTileSelected(screen7FilterModeMask, FILTER_MODE_CW));
+  drawFilterTile(modeStartX + 2 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "SSB", isModeFilterTileSelected(screen7FilterModeMask, FILTER_MODE_SSB));
+  drawFilterTile(modeStartX + 3 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "DIGI", isModeFilterTileSelected(screen7FilterModeMask, FILTER_MODE_DIGI));
 
   tft.setTextColor(TFT_LIGHTGREY);
   tft.setCursor(10, 82);
@@ -4270,7 +7016,7 @@ void drawPotaFilterMenu() {
       if (bandIdx >= SCREEN2_FILTER_BANDS_COUNT) break;
       int x = bandStartX + col * (bandTileW + bandGap);
       int y = bandStartY + row * (bandTileH + bandGap);
-      drawFilterTile(x, y, bandTileW, bandTileH, SCREEN2_FILTER_BANDS[bandIdx], screen7FilterBandIndex == bandIdx);
+      drawFilterTile(x, y, bandTileW, bandTileH, SCREEN2_FILTER_BANDS[bandIdx], isBandFilterTileSelected(screen7FilterBandMask, bandIdx));
       bandIdx++;
     }
   }
@@ -4292,7 +7038,7 @@ void handleScreen7MenuTouch(uint16_t x, uint16_t y) {
   for (int i = 0; i < 4; i++) {
     int rx = modeStartX + i * (modeTileW + modeGap);
     if (isPointInRect(x, y, rx, modeY, modeTileW, modeTileH)) {
-      screen7FilterMode = (Screen2FilterMode)i;
+      toggleModeFilterSelection(screen7FilterModeMask, i);
       drawPotaFilterMenu();
       return;
     }
@@ -4310,7 +7056,7 @@ void handleScreen7MenuTouch(uint16_t x, uint16_t y) {
       int rx = bandStartX + col * (bandTileW + bandGap);
       int ry = bandStartY + row * (bandTileH + bandGap);
       if (isPointInRect(x, y, rx, ry, bandTileW, bandTileH)) {
-        screen7FilterBandIndex = bandIdx;
+        toggleBandFilterSelection(screen7FilterBandMask, bandIdx);
         drawPotaFilterMenu();
         return;
       }
@@ -4323,6 +7069,7 @@ void handleScreen7MenuTouch(uint16_t x, uint16_t y) {
   const int closeX = (320 - closeW) / 2;
   const int closeY = 210;
   if (isPointInRect(x, y, closeX, closeY, closeW, closeH)) {
+    savePreferences();
     inMenu = false;
     drawScreen(SCREEN_POTA_CLUSTER);
     return;
@@ -4346,10 +7093,10 @@ void drawHamalertFilterMenu() {
   const int modeGap = 6;
   const int modeStartX = (320 - (4 * modeTileW + 3 * modeGap)) / 2;
   const int modeY = 40;
-  drawFilterTile(modeStartX + 0 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "ALL", screen8FilterMode == FILTER_MODE_ALL);
-  drawFilterTile(modeStartX + 1 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "CW", screen8FilterMode == FILTER_MODE_CW);
-  drawFilterTile(modeStartX + 2 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "SSB", screen8FilterMode == FILTER_MODE_SSB);
-  drawFilterTile(modeStartX + 3 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "DIGI", screen8FilterMode == FILTER_MODE_DIGI);
+  drawFilterTile(modeStartX + 0 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "ALL", isModeFilterTileSelected(screen8FilterModeMask, FILTER_MODE_ALL));
+  drawFilterTile(modeStartX + 1 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "CW", isModeFilterTileSelected(screen8FilterModeMask, FILTER_MODE_CW));
+  drawFilterTile(modeStartX + 2 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "SSB", isModeFilterTileSelected(screen8FilterModeMask, FILTER_MODE_SSB));
+  drawFilterTile(modeStartX + 3 * (modeTileW + modeGap), modeY, modeTileW, modeTileH, "DIGI", isModeFilterTileSelected(screen8FilterModeMask, FILTER_MODE_DIGI));
 
   tft.setTextColor(TFT_LIGHTGREY);
   tft.setCursor(10, 82);
@@ -4366,7 +7113,7 @@ void drawHamalertFilterMenu() {
       if (bandIdx >= SCREEN8_FILTER_BANDS_COUNT) break;
       int x = bandStartX + col * (bandTileW + bandGap);
       int y = bandStartY + row * (bandTileH + bandGap);
-      drawFilterTile(x, y, bandTileW, bandTileH, SCREEN8_FILTER_BANDS[bandIdx], screen8FilterBandIndex == bandIdx);
+      drawFilterTile(x, y, bandTileW, bandTileH, SCREEN8_FILTER_BANDS[bandIdx], isBandFilterTileSelected(screen8FilterBandMask, bandIdx));
       bandIdx++;
     }
   }
@@ -4388,7 +7135,7 @@ void handleScreen8MenuTouch(uint16_t x, uint16_t y) {
   for (int i = 0; i < 4; i++) {
     int rx = modeStartX + i * (modeTileW + modeGap);
     if (isPointInRect(x, y, rx, modeY, modeTileW, modeTileH)) {
-      screen8FilterMode = (Screen2FilterMode)i;
+      toggleModeFilterSelection(screen8FilterModeMask, i);
       drawHamalertFilterMenu();
       return;
     }
@@ -4406,7 +7153,7 @@ void handleScreen8MenuTouch(uint16_t x, uint16_t y) {
       int rx = bandStartX + col * (bandTileW + bandGap);
       int ry = bandStartY + row * (bandTileH + bandGap);
       if (isPointInRect(x, y, rx, ry, bandTileW, bandTileH)) {
-        screen8FilterBandIndex = bandIdx;
+        toggleBandFilterSelection(screen8FilterBandMask, bandIdx);
         drawHamalertFilterMenu();
         return;
       }
@@ -4419,6 +7166,7 @@ void handleScreen8MenuTouch(uint16_t x, uint16_t y) {
   const int closeX = (320 - closeW) / 2;
   const int closeY = 210;
   if (isPointInRect(x, y, closeX, closeY, closeW, closeH)) {
+    savePreferences();
     inMenu = false;
     drawScreen(SCREEN_HAMALERT_CLUSTER);
     return;
@@ -4557,11 +7305,32 @@ void drawThemeSlider() {
 }
 
 void drawBrightnessMenuHeader() {
+  const int themeBtnX = 248;
+  const int themeBtnY = 4;
+  const int themeBtnW = 68;
+  const int themeBtnH = 20;
+
   tft.fillRect(0, 0, 320, 28, menuThemeColor);
   tft.setTextColor(TFT_BLACK);
   tft.setTextSize(2);
   tft.setCursor(10, 6);
   tft.print(tr(TR_DISPLAY_SETTINGS));
+
+  uint16_t btnFill = isTftStyleLight() ? TFT_WHITE : TFT_BLACK;
+  uint16_t btnBorder = isTftStyleLight() ? TFT_BLACK : TFT_WHITE;
+  uint16_t btnText = isTftStyleLight() ? TFT_BLACK : TFT_WHITE;
+  const bool isPl = (tftLanguage == TFT_LANG_PL);
+  const char *btnLabel = isPl
+      ? (isTftStyleLight() ? "JASNY" : "CIEMNY")
+      : (isTftStyleLight() ? "LIGHT" : "DARK");
+  int textW = strlen(btnLabel) * 6;
+
+  tft.fillRoundRect(themeBtnX, themeBtnY, themeBtnW, themeBtnH, 4, btnFill);
+  tft.drawRoundRect(themeBtnX, themeBtnY, themeBtnW, themeBtnH, 4, btnBorder);
+  tft.setTextSize(1);
+  tft.setTextColor(btnText);
+  tft.setCursor(themeBtnX + (themeBtnW - textW) / 2, themeBtnY + 6);
+  tft.print(btnLabel);
 }
 
 void drawBrightnessMenu() {
@@ -4831,6 +7600,19 @@ void handleTouchCalibrationTouch(int16_t rawX, int16_t rawY, uint16_t x, uint16_
 
 void handleBrightnessMenuTouch(uint16_t x, uint16_t y, bool isNewTap) {
   unsigned long now = millis();
+
+  const int themeBtnHitX = 205;
+  const int themeBtnHitY = 0;
+  const int themeBtnHitW = 115;
+  const int themeBtnHitH = 44;
+
+  // Przycisk zmiany motywu ma priorytet i działa od razu po otwarciu menu.
+  if (isNewTap && isPointInRect(x, y, themeBtnHitX, themeBtnHitY, themeBtnHitW, themeBtnHitH)) {
+    tftStyleMode = isTftStyleLight() ? TFT_STYLE_DARK : TFT_STYLE_LIGHT;
+    applyTftUiPalette();
+    drawBrightnessMenu();
+    return;
+  }
   
   if (now - brightnessMenuOpenedMs < 1500) {
     return;
@@ -4874,12 +7656,14 @@ void handleBrightnessMenuTouch(uint16_t x, uint16_t y, bool isNewTap) {
       tftLanguage = TFT_LANG_PL;
       // Wymuś odświeżenie opisów pogody po zmianie języka
       lastWeatherFetchMs = 0;
+      lockWeatherData();
       weatherData.valid = false;
       weatherData.forecast3hValid = false;
       weatherData.forecastNextDayValid = false;
       for (uint8_t i = 0; i < WeatherData::DETAIL_COLS; i++) {
         weatherData.detailValid[i] = false;
       }
+      unlockWeatherData();
       savePreferences();
       drawBrightnessMenu();
       return;
@@ -4888,12 +7672,14 @@ void handleBrightnessMenuTouch(uint16_t x, uint16_t y, bool isNewTap) {
       tftLanguage = TFT_LANG_EN;
       // Wymuś odświeżenie opisów pogody po zmianie języka
       lastWeatherFetchMs = 0;
+      lockWeatherData();
       weatherData.valid = false;
       weatherData.forecast3hValid = false;
       weatherData.forecastNextDayValid = false;
       for (uint8_t i = 0; i < WeatherData::DETAIL_COLS; i++) {
         weatherData.detailValid[i] = false;
       }
+      unlockWeatherData();
       savePreferences();
       drawBrightnessMenu();
       return;
@@ -4931,6 +7717,8 @@ void handleBrightnessMenuTouch(uint16_t x, uint16_t y, bool isNewTap) {
     setBacklightPercent(backlightPercent);
     menuThemeHue = brightnessMenuPrevThemeHue;
     applyMenuThemeFromHue();
+    tftStyleMode = brightnessMenuPrevStyleMode;
+    applyTftUiPalette();
     brightnessMenuActive = false;
     restoreAfterBrightnessMenu();
     return;
@@ -4958,8 +7746,8 @@ void updateScreen6Clock() {
   strftime(timeBuffer, 6, "%H:%M", &timeinfo);
   int timeWidth = strlen(timeBuffer) * 12;
   bool radarMode = (currentScreen == SCREEN_APRS_RADAR);
-  uint16_t topClearColor = radarMode ? TFT_BLACK : TFT_RADIO_ORANGE;
-  uint16_t timeColor = radarMode ? TFT_WHITE : TFT_BLACK;
+  uint16_t topClearColor = radarMode ? (isTftStyleLight() ? tftUiPalette.bg : TFT_BLACK) : tftHeaderBgColor();
+  uint16_t timeColor = radarMode ? (isTftStyleLight() ? tftUiPalette.fg : TFT_WHITE) : tftHeaderTextColor();
   int timeY = radarMode ? 5 : 8;
 
   if (strcmp(lastDrawnTime, timeBuffer) == 0 && lastRadarMode == radarMode) {
@@ -5053,30 +7841,34 @@ void updateScreen6Data() {
   const bool navVisible = isTableNavFooterVisible(SCREEN_APRS_IS);
   const bool enlarged = isDxTableEnlarged();
   const int maxRows = getAprsTableMaxRows();
+  const int aprsKmXEnlarged = 195;
+  const int aprsFreqXEnlarged = 234;
+  const int aprsKmXNormal = 197;
+  const int aprsFreqXNormal = 255;
   const int tableTop = TFT_TABLE_TOP;
   const int tableBottom = getTableBottomForScreen(SCREEN_APRS_IS);
   const int tableHeight = tableBottom - tableTop;
   TFT_eSprite *tableSprite = (navVisible && ensureSharedTableSprite()) ? &sharedTableSprite : nullptr;
 
   if (tableSprite != nullptr) {
-    tableSprite->fillSprite(TFT_BLACK);
+    tableSprite->fillSprite(tftUiPalette.bg);
 
     int yPos = 8;
-    tableSprite->setTextColor(TFT_DARKGREY);
+    tableSprite->setTextColor(tftUiPalette.muted);
     tableSprite->setTextSize(1);
     if (enlarged) {
       tableSprite->setCursor(5, yPos);   tableSprite->print("UTC");
       tableSprite->setCursor(74, yPos);  tableSprite->print("CALL");
-      tableSprite->setCursor(198, yPos); tableSprite->print("KM");
-      tableSprite->setCursor(224, yPos); tableSprite->print("FREQ");
+      tableSprite->setCursor(aprsKmXEnlarged, yPos); tableSprite->print("KM");
+      tableSprite->setCursor(aprsFreqXEnlarged, yPos); tableSprite->print("FREQ");
     } else {
       tableSprite->setCursor(5, yPos);   tableSprite->print("UTC");
       tableSprite->setCursor(50, yPos);  tableSprite->print("CALLSIGN");
       tableSprite->setCursor(125, yPos); tableSprite->print("SYMBOL");
-      tableSprite->setCursor(200, yPos); tableSprite->print("KM");
-      tableSprite->setCursor(245, yPos); tableSprite->print("FREQ");
+      tableSprite->setCursor(aprsKmXNormal, yPos); tableSprite->print("KM");
+      tableSprite->setCursor(aprsFreqXNormal, yPos); tableSprite->print("FREQ");
     }
-    tableSprite->drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
+    tableSprite->drawFastHLine(0, yPos + 10, 320, tftUiPalette.muted);
     yPos += enlarged ? 20 : 18;
 
     int order[MAX_APRS_DISPLAY_LCD];
@@ -5090,12 +7882,12 @@ void updateScreen6Data() {
       const APRSStation &station = aprsStations[order[i]];
       if (enlarged) {
         if (i % 2 == 0) {
-          tableSprite->fillRect(0, yPos - 5, 320, 24, TFT_TABLE_ALT_ROW_COLOR);
+          tableSprite->fillRect(0, yPos - 5, 320, 24, tftUiPalette.rowAlt);
         }
 
         tableSprite->setTextSize(2);
 
-        tableSprite->setTextColor(TFT_LIGHTGREY);
+        tableSprite->setTextColor(tftUiPalette.muted);
         tableSprite->setCursor(5, yPos);
         String timeStr = formatAprsTimeWithTimezone(station.time);
         tableSprite->print(timeStr);
@@ -5103,19 +7895,19 @@ void updateScreen6Data() {
         tableSprite->setTextColor(getAprsCallsignColorForEnlarged(station));
         tableSprite->setCursor(74, yPos);
         String callText = station.callsign;
-        if (callText.length() > 8) callText = callText.substring(0, 8);
+        if (callText.length() > 9) callText = callText.substring(0, 9);
         tableSprite->print(callText);
 
-        tableSprite->setTextColor(TFT_RADIO_ORANGE);
-        tableSprite->setCursor(198, yPos);
+        tableSprite->setTextColor(tftTableAccentTextColor());
+        tableSprite->setCursor(aprsKmXEnlarged, yPos);
         if (station.hasLatLon && station.distance > 0) {
-          tableSprite->print((int)station.distance);
+          tableSprite->print(roundAprsDistanceKm(station.distance));
         } else {
           tableSprite->print("-");
         }
 
-        tableSprite->setTextColor(TFT_CYAN);
-        tableSprite->setCursor(224, yPos);
+        tableSprite->setTextColor(tftTableFreqColor());
+        tableSprite->setCursor(aprsFreqXEnlarged, yPos);
         if (station.freqMHz > 0.0f) {
           tableSprite->print(String(station.freqMHz, 3));
         } else {
@@ -5125,44 +7917,48 @@ void updateScreen6Data() {
         yPos += 27;
       } else {
         if (i % 2 == 0) {
-          tableSprite->fillRect(0, yPos - 2, 320, 16, TFT_TABLE_ALT_ROW_COLOR);
+          tableSprite->fillRect(0, yPos - 2, 320, 16, tftUiPalette.rowAlt);
         }
 
         tableSprite->setTextSize(1);
 
-        tableSprite->setTextColor(TFT_LIGHTGREY);
+        tableSprite->setTextColor(tftUiPalette.muted);
         tableSprite->setCursor(5, yPos);
         String timeStr = formatAprsTimeWithTimezone(station.time);
         tableSprite->print(timeStr);
 
-        tableSprite->setTextColor(TFT_WHITE);
+        tableSprite->setTextColor(tftUiPalette.fg);
         tableSprite->setCursor(50, yPos);
         tableSprite->print(station.callsign);
 
         String symbolShort = getAPRSSymbolShort(station);
         uint16_t symbolColor = TFT_GREEN;
-        if (symbolShort == "HUMAN") {
-          symbolColor = TFT_BLUE;
+        if (isTftStyleLight()) {
+          symbolColor = tftUiPalette.fg;
+        } else if (symbolShort == "HUMAN") {
+          symbolColor = 0x3C1F;
         } else if (symbolShort == "HOUSE") {
           symbolColor = TFT_YELLOW;
         } else if (symbolShort == "CAR") {
           symbolColor = TFT_RED;
+        } else if (symbolShort == "HAMCLOCK") {
+          symbolColor = TFT_ORANGE;
         }
         tableSprite->setTextColor(symbolColor);
         tableSprite->setCursor(125, yPos);
         tableSprite->print(symbolShort);
 
-        tableSprite->setTextColor(TFT_RADIO_ORANGE);
-        tableSprite->setCursor(200, yPos);
+        tableSprite->setTextColor(tftTableAccentTextColor());
+        tableSprite->setCursor(aprsKmXNormal, yPos);
         if (station.hasLatLon && station.distance > 0) {
-          tableSprite->print((int)station.distance);
+          tableSprite->print(roundAprsDistanceKm(station.distance));
           tableSprite->print(" km");
         } else {
           tableSprite->print("-");
         }
 
-        tableSprite->setTextColor(TFT_CYAN);
-        tableSprite->setCursor(245, yPos);
+        tableSprite->setTextColor(tftTableFreqColor());
+        tableSprite->setCursor(aprsFreqXNormal, yPos);
         if (station.freqMHz > 0.0f) {
           tableSprite->print(String(station.freqMHz, 3));
         } else {
@@ -5185,24 +7981,24 @@ void updateScreen6Data() {
   }
 
   // Fallback bez sprite (np. gdy zabraknie RAM)
-  tft.fillRect(0, tableTop, 320, tableHeight, TFT_BLACK);
+  tft.fillRect(0, tableTop, 320, tableHeight, tftUiPalette.bg);
 
   int yPos = 40;
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(tftUiPalette.muted);
   tft.setTextSize(1);
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(198, yPos); tft.print("KM");
-    tft.setCursor(224, yPos); tft.print("FREQ");
+    tft.setCursor(aprsKmXEnlarged, yPos); tft.print("KM");
+    tft.setCursor(aprsFreqXEnlarged, yPos); tft.print("FREQ");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("SYMBOL");
-    tft.setCursor(200, yPos); tft.print("KM");
-    tft.setCursor(245, yPos); tft.print("FREQ");
+    tft.setCursor(aprsKmXNormal, yPos); tft.print("KM");
+    tft.setCursor(aprsFreqXNormal, yPos); tft.print("FREQ");
   }
-  tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
+  tft.drawFastHLine(0, yPos + 10, 320, tftUiPalette.muted);
   yPos += enlarged ? 20 : 18;
 
   int order[MAX_APRS_DISPLAY_LCD];
@@ -5216,12 +8012,12 @@ void updateScreen6Data() {
     const APRSStation &station = aprsStations[order[i]];
     if (enlarged) {
       if (i % 2 == 0) {
-        tft.fillRect(0, yPos - 5, 320, 24, TFT_TABLE_ALT_ROW_COLOR);
+        tft.fillRect(0, yPos - 5, 320, 24, tftUiPalette.rowAlt);
       }
 
       tft.setTextSize(2);
 
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       String timeStr = formatAprsTimeWithTimezone(station.time);
       tft.print(timeStr);
@@ -5229,19 +8025,19 @@ void updateScreen6Data() {
       tft.setTextColor(getAprsCallsignColorForEnlarged(station));
       tft.setCursor(74, yPos);
       String callText = station.callsign;
-      if (callText.length() > 8) callText = callText.substring(0, 8);
+      if (callText.length() > 9) callText = callText.substring(0, 9);
       tft.print(callText);
 
-      tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(198, yPos);
+      tft.setTextColor(tftTableAccentTextColor());
+      tft.setCursor(aprsKmXEnlarged, yPos);
       if (station.hasLatLon && station.distance > 0) {
-        tft.print((int)station.distance);
+        tft.print(roundAprsDistanceKm(station.distance));
       } else {
         tft.print("-");
       }
 
-      tft.setTextColor(TFT_CYAN);
-      tft.setCursor(224, yPos);
+      tft.setTextColor(tftTableFreqColor());
+      tft.setCursor(aprsFreqXEnlarged, yPos);
       if (station.freqMHz > 0.0f) {
         tft.print(String(station.freqMHz, 3));
       } else {
@@ -5251,44 +8047,48 @@ void updateScreen6Data() {
       yPos += 27;
     } else {
       if (i % 2 == 0) {
-        tft.fillRect(0, yPos - 2, 320, 16, TFT_TABLE_ALT_ROW_COLOR);
+        tft.fillRect(0, yPos - 2, 320, 16, tftUiPalette.rowAlt);
       }
 
       tft.setTextSize(1);
 
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       String timeStr = formatAprsTimeWithTimezone(station.time);
       tft.print(timeStr);
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(50, yPos);
       tft.print(station.callsign);
 
       String symbolShort = getAPRSSymbolShort(station);
       uint16_t symbolColor = TFT_GREEN;
-      if (symbolShort == "HUMAN") {
-        symbolColor = TFT_BLUE;
+      if (isTftStyleLight()) {
+        symbolColor = tftUiPalette.fg;
+      } else if (symbolShort == "HUMAN") {
+        symbolColor = 0x3C1F;
       } else if (symbolShort == "HOUSE") {
         symbolColor = TFT_YELLOW;
       } else if (symbolShort == "CAR") {
         symbolColor = TFT_RED;
+      } else if (symbolShort == "HAMCLOCK") {
+        symbolColor = TFT_ORANGE;
       }
       tft.setTextColor(symbolColor);
       tft.setCursor(125, yPos);
       tft.print(symbolShort);
 
-      tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(200, yPos);
+      tft.setTextColor(tftTableAccentTextColor());
+      tft.setCursor(aprsKmXNormal, yPos);
       if (station.hasLatLon && station.distance > 0) {
-        tft.print((int)station.distance);
+        tft.print(roundAprsDistanceKm(station.distance));
         tft.print(" km");
       } else {
         tft.print("-");
       }
 
-      tft.setTextColor(TFT_CYAN);
-      tft.setCursor(245, yPos);
+      tft.setTextColor(tftTableFreqColor());
+      tft.setCursor(aprsFreqXNormal, yPos);
       if (station.freqMHz > 0.0f) {
         tft.print(String(station.freqMHz, 3));
       } else {
@@ -5309,11 +8109,15 @@ void updateScreen6Data() {
 
 void drawAprsIs() {
   screen6ViewMode = APRS_VIEW_LIST;
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(tftUiPalette.bg);
+  const int aprsKmXEnlarged = 195;
+  const int aprsFreqXEnlarged = 234;
+  const int aprsKmXNormal = 197;
+  const int aprsFreqXNormal = 255;
 
   // 1. NAGĹĂ“WEK: Belka z menu, nazwÄ… serwera i czasem UTC
-  tft.fillRect(0, 0, 320, 32, TFT_RADIO_ORANGE);
-  tft.setTextColor(TFT_BLACK);
+  tft.fillRect(0, 0, 320, 32, tftHeaderBgColor());
+  tft.setTextColor(tftHeaderTextColor());
 
   // IKONA MENU (3D)
   drawHamburgerMenuButton3D(5, 7);
@@ -5321,7 +8125,13 @@ void drawAprsIs() {
   // Nazwa serwera APRS-IS - przesuniÄ™ta w prawo (x=35 zamiast 5), by zrobiÄ‡ miejsce na menu
   tft.setTextSize(2);
   tft.setCursor(35, 8);
-  tft.print("APRS-IS");
+  if (isUart2AprsTncKissModuleSelected()) {
+    tft.print("APRS-TNC-KISS");
+  } else if (isUart2AprsUartSourceEnabled()) {
+    tft.print("APRS-TNC2-UART");
+  } else {
+    tft.print("APRS-IS");
+  }
   
   struct tm timeinfo;
   if (getTimeWithTimezone(&timeinfo)) {
@@ -5335,20 +8145,21 @@ void drawAprsIs() {
   // 2. NAGĹĂ“WKI TABELI
   int yPos = 40;
   const bool enlarged = isDxTableEnlarged();
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(tftUiPalette.muted);
   tft.setTextSize(1);
   if (enlarged) {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(74, yPos);  tft.print("CALL");
-    tft.setCursor(198, yPos); tft.print("KM");
-    tft.setCursor(224, yPos); tft.print("FREQ");
+    tft.setCursor(aprsKmXEnlarged, yPos); tft.print("KM");
+    tft.setCursor(aprsFreqXEnlarged, yPos); tft.print("FREQ");
   } else {
     tft.setCursor(5, yPos);   tft.print("UTC");
     tft.setCursor(50, yPos);  tft.print("CALLSIGN");
     tft.setCursor(125, yPos); tft.print("SYMBOL");
-    tft.setCursor(200, yPos); tft.print("KM");
+    tft.setCursor(aprsKmXNormal, yPos); tft.print("KM");
+    tft.setCursor(aprsFreqXNormal, yPos); tft.print("FREQ");
   }
-  tft.drawFastHLine(0, yPos + 10, 320, TFT_DARKGREY);
+  tft.drawFastHLine(0, yPos + 10, 320, tftUiPalette.muted);
   yPos += enlarged ? 20 : 18;
 
   // 3. LISTA STACJI APRS (10 z paskiem nawigacji, 11 bez)
@@ -5360,10 +8171,10 @@ void drawAprsIs() {
   for (int i = 0; i < visibleCount; i++) {
     const APRSStation &station = aprsStations[order[i]];
     if (enlarged) {
-      if (i % 2 == 0) tft.fillRect(0, yPos - 5, 320, 24, TFT_TABLE_ALT_ROW_COLOR);
+      if (i % 2 == 0) tft.fillRect(0, yPos - 5, 320, 24, tftUiPalette.rowAlt);
 
       tft.setTextSize(2);
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       String timeStr = formatAprsTimeWithTimezone(station.time);
       tft.print(timeStr);
@@ -5371,19 +8182,19 @@ void drawAprsIs() {
       tft.setTextColor(getAprsCallsignColorForEnlarged(station));
       tft.setCursor(74, yPos);
       String callText = station.callsign;
-      if (callText.length() > 8) callText = callText.substring(0, 8);
+      if (callText.length() > 9) callText = callText.substring(0, 9);
       tft.print(callText);
 
-      tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(198, yPos);
+      tft.setTextColor(tftTableAccentTextColor());
+      tft.setCursor(aprsKmXEnlarged, yPos);
       if (station.hasLatLon && station.distance > 0) {
-        tft.print((int)station.distance);
+        tft.print(roundAprsDistanceKm(station.distance));
       } else {
         tft.print("-");
       }
 
-      tft.setTextColor(TFT_CYAN);
-      tft.setCursor(224, yPos);
+      tft.setTextColor(tftTableFreqColor());
+      tft.setCursor(aprsFreqXEnlarged, yPos);
       if (station.freqMHz > 0.0f) {
         tft.print(String(station.freqMHz, 3));
       } else {
@@ -5392,36 +8203,48 @@ void drawAprsIs() {
 
       yPos += 27;
     } else {
-      if (i % 2 == 0) tft.fillRect(0, yPos - 2, 320, 16, TFT_TABLE_ALT_ROW_COLOR);
+      if (i % 2 == 0) tft.fillRect(0, yPos - 2, 320, 16, tftUiPalette.rowAlt);
 
       tft.setTextSize(1);
-      tft.setTextColor(TFT_LIGHTGREY);
+      tft.setTextColor(tftUiPalette.muted);
       tft.setCursor(5, yPos);
       String timeStr = formatAprsTimeWithTimezone(station.time);
       tft.print(timeStr);
 
-      tft.setTextColor(TFT_WHITE);
+      tft.setTextColor(tftUiPalette.fg);
       tft.setCursor(50, yPos);
       tft.print(station.callsign);
 
       String symbolShort = getAPRSSymbolShort(station);
       uint16_t symbolColor = TFT_GREEN;
-      if (symbolShort == "HUMAN") {
-        symbolColor = TFT_BLUE;
+      if (isTftStyleLight()) {
+        symbolColor = tftUiPalette.fg;
+      } else if (symbolShort == "HUMAN") {
+        symbolColor = 0x3C1F;
       } else if (symbolShort == "HOUSE") {
         symbolColor = TFT_YELLOW;
       } else if (symbolShort == "CAR") {
         symbolColor = TFT_RED;
+      } else if (symbolShort == "HAMCLOCK") {
+        symbolColor = TFT_ORANGE;
       }
       tft.setTextColor(symbolColor);
       tft.setCursor(125, yPos);
       tft.print(symbolShort);
 
-      tft.setTextColor(TFT_RADIO_ORANGE);
-      tft.setCursor(200, yPos);
+      tft.setTextColor(tftTableAccentTextColor());
+      tft.setCursor(aprsKmXNormal, yPos);
       if (station.hasLatLon && station.distance > 0) {
-        tft.print((int)station.distance);
+        tft.print(roundAprsDistanceKm(station.distance));
         tft.print(" km");
+      } else {
+        tft.print("-");
+      }
+
+      tft.setTextColor(tftTableFreqColor());
+      tft.setCursor(aprsFreqXNormal, yPos);
+      if (station.freqMHz > 0.0f) {
+        tft.print(String(station.freqMHz, 3));
       } else {
         tft.print("-");
       }
@@ -5445,12 +8268,15 @@ void drawAprsIs() {
 
 void drawAprsRadar() {
   screen6ViewMode = APRS_VIEW_RADAR;
-  tft.fillScreen(TFT_BLACK);
+  const bool lightTheme = isTftStyleLight();
+  const uint16_t radarBgColor = lightTheme ? TFT_WHITE : TFT_BLACK;
+  const uint16_t radarTextColor = lightTheme ? tftUiPalette.fg : TFT_WHITE;
+  tft.fillScreen(radarBgColor);
   drawAprsRadarBody();
 
   drawHamburgerMenuButton3D(5, 7);
 
-  tft.setTextColor(TFT_WHITE);
+  tft.setTextColor(radarTextColor);
   tft.setTextSize(2);
   const char *aprsTitleTop = "APRS";
   const char *aprsTitleBottom = "RADAR";
@@ -5468,6 +8294,7 @@ void drawAprsRadar() {
     char timeBuffer[6];
     strftime(timeBuffer, 6, "%H:%M", &timeinfo);
     int timeWidth = strlen(timeBuffer) * 12;
+    tft.setTextColor(radarTextColor);
     tft.setCursor(tft.width() - timeWidth - 4, 5);
     tft.print(timeBuffer);
   }
@@ -5518,11 +8345,13 @@ static bool parsePropagationXml(const String &xml, PropagationData &out) {
   String sfi = extractXmlTagValue(xml, "solarflux");
   String kindex = extractXmlTagValue(xml, "kindex");
   String aindex = extractXmlTagValue(xml, "aindex");
+  String muf = extractXmlTagValue(xml, "muf");
   String updated = extractXmlTagValue(xml, "updated");
 
   sfi.trim();
   kindex.trim();
   aindex.trim();
+  muf.trim();
   updated.trim();
 
   if (sfi.length() == 0 || kindex.length() == 0) {
@@ -5532,6 +8361,7 @@ static bool parsePropagationXml(const String &xml, PropagationData &out) {
   out.sfi = sfi;
   out.kindex = kindex;
   out.aindex = aindex.length() ? aindex : "--";
+  out.muf = muf.length() ? muf : "--";
   out.updated = updated.length() ? updated : "--";
   out.valid = true;
   out.lastError = "";
@@ -5617,6 +8447,7 @@ uint32_t computeScreen3Signature() {
     &propagationData.sfi,
     &propagationData.kindex,
     &propagationData.aindex,
+    &propagationData.muf,
     &propagationData.updated,
     &propagationData.lastError
   };
@@ -5641,65 +8472,79 @@ static uint16_t conditionColor(String cond) {
 
 void drawSunSpotsBody() {
   const int bodyTop = 32;
-  const int bodyBottom = 220;
-  tft.fillRect(0, bodyTop, 320, bodyBottom - bodyTop, TFT_BLACK);
+  const int bodyBottom = 240;
+  tft.fillRect(0, bodyTop, 320, bodyBottom - bodyTop, tftUiPalette.bg);
 
   String sfiText = propagationData.valid && propagationData.sfi.length() ? propagationData.sfi : "--";
   String kText = propagationData.valid && propagationData.kindex.length() ? propagationData.kindex : "--";
   String aText = propagationData.valid && propagationData.aindex.length() ? propagationData.aindex : "--";
+  String mufText = propagationData.valid && propagationData.muf.length() ? propagationData.muf : "--";
   String updatedText = propagationData.valid && propagationData.updated.length() ? propagationData.updated : "--";
 
   tft.setTextSize(2);
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(tftUiPalette.muted);
   tft.setCursor(10, 52);
   tft.print("SFI");
 
   tft.setTextSize(4);
-  tft.setTextColor(TFT_GREEN);
+  tft.setTextColor(isTftStyleLight() ? tftUiPalette.fg : TFT_GREEN);
   int sfiWidth = sfiText.length() * 24;
   tft.setCursor(310 - sfiWidth, 44);
   tft.print(sfiText);
 
   tft.setTextSize(2);
-  tft.setTextColor(TFT_DARKGREY);
-  tft.setCursor(10, 100);
+  tft.setTextColor(tftUiPalette.muted);
+  tft.setCursor(10, 97);
   tft.print("K-INDEX");
 
   float kVal = kText.length() ? kText.toFloat() : -1.0f;
-  uint16_t kColor = TFT_LIGHTGREY;
+  uint16_t kColor = tftUiPalette.fg;
   if (kVal >= 0.0f) {
-    kColor = (kVal < 4.0f) ? TFT_GREEN : (kVal < 6.0f) ? TFT_ORANGE : TFT_RED;
+    if (!isTftStyleLight()) {
+      kColor = (kVal < 4.0f) ? TFT_GREEN : (kVal < 6.0f) ? TFT_ORANGE : TFT_RED;
+    }
   }
   tft.setTextSize(4);
   tft.setTextColor(kColor);
   int kWidth = kText.length() * 24;
-  tft.setCursor(310 - kWidth, 92);
+  tft.setCursor(310 - kWidth, 89);
   tft.print(kText);
 
   tft.setTextSize(2);
-  tft.setTextColor(TFT_DARKGREY);
-  tft.setCursor(10, 148);
+  tft.setTextColor(tftUiPalette.muted);
+  tft.setCursor(10, 142);
   tft.print("A-INDEX");
 
   tft.setTextSize(4);
-  tft.setTextColor(TFT_CYAN);
+  tft.setTextColor(isTftStyleLight() ? tftUiPalette.fg : TFT_CYAN);
   int aWidth = aText.length() * 24;
-  tft.setCursor(310 - aWidth, 140);
+  tft.setCursor(310 - aWidth, 134);
   tft.print(aText);
 
+  tft.setTextSize(2);
+  tft.setTextColor(tftUiPalette.muted);
+  tft.setCursor(10, 182);
+  tft.print("MUF");
+
+  tft.setTextSize(3);
+  tft.setTextColor(isTftStyleLight() ? tftUiPalette.fg : TFT_YELLOW);
+  int mufWidth = mufText.length() * 18;
+  tft.setCursor(310 - mufWidth, 174);
+  tft.print(mufText);
+
   tft.setTextSize(1);
-  tft.setTextColor(TFT_DARKGREY);
-  tft.setCursor(10, 190);
+  tft.setTextColor(tftUiPalette.muted);
+  tft.setCursor(10, 210);
   tft.print("UPDATED UTC");
   tft.setTextSize(2);
-  tft.setTextColor(TFT_LIGHTGREY);
-  tft.setCursor(10, 202);
+  tft.setTextColor(tftUiPalette.fg);
+  tft.setCursor(10, 222);
   tft.print(updatedText);
 
   if (!propagationData.valid) {
     tft.setTextSize(1);
-    tft.setTextColor(TFT_RED);
-    tft.setCursor(10, 176);
+    tft.setTextColor(isTftStyleLight() ? tftUiPalette.fg : TFT_RED);
+    tft.setCursor(10, 196);
     String err = propagationData.lastError.length() ? propagationData.lastError : tr(TR_NO_DATA);
     tft.print(tr(TR_ERROR_PREFIX));
     tft.print(err);
@@ -5724,7 +8569,7 @@ void updateScreen3Data() {
 }
 
 void drawSunSpots() {
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(tftUiPalette.bg);
 
   tft.fillRect(0, 0, 320, 32, TFT_RADIO_ORANGE);
   tft.setTextColor(TFT_BLACK);
@@ -5745,13 +8590,6 @@ void drawSunSpots() {
   }
 
   drawSunSpotsBody();
-
-  tft.fillTriangle(10, 230, 20, 222, 20, 238, TFT_RADIO_ORANGE);
-  tft.fillTriangle(310, 230, 300, 222, 300, 238, TFT_RADIO_ORANGE);
-  tft.setTextColor(0x52AA);
-  tft.setTextSize(1);
-  tft.setCursor(125, 226);
-  tft.print("SWITCH SCREEN");
 }
 
 void updateScreen4Clock() {
@@ -5813,10 +8651,10 @@ uint32_t computeScreen4Signature() {
 void drawBandInfoBody() {
   const int bodyTop = 32;
   const int bodyBottom = 220;
-  tft.fillRect(0, bodyTop, 320, bodyBottom - bodyTop, TFT_BLACK);
+  tft.fillRect(0, bodyTop, 320, bodyBottom - bodyTop, tftUiPalette.bg);
 
   int yPos = 40;
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(tftUiPalette.muted);
   tft.setTextSize(2);
   tft.setCursor(5, yPos);
   tft.print("BAND");
@@ -5824,16 +8662,16 @@ void drawBandInfoBody() {
   tft.print("DAY");
   tft.setCursor(240, yPos);
   tft.print("NIGHT");
-  tft.drawFastHLine(0, yPos + 30, 320, TFT_DARKGREY);
+  tft.drawFastHLine(0, yPos + 30, 320, tftUiPalette.muted);
   yPos += 26; //byĹ‚o 16
 
   for (int i = 0; i < 4; i++) {
     if (i % 2 == 0) {
-      tft.fillRect(0, yPos - 2, 320, 28, TFT_TABLE_ALT_ROW_COLOR);
+      tft.fillRect(0, yPos - 2, 320, 28, tftUiPalette.rowAlt);
     }
 
     tft.setTextSize(2);
-    tft.setTextColor(TFT_LIGHTGREY);
+    tft.setTextColor(tftUiPalette.fg);
     tft.setCursor(5, yPos);
     tft.print(propagationData.hfBandLabel[i]);
 
@@ -5842,11 +8680,19 @@ void drawBandInfoBody() {
     //tft.print(propagationData.hfBandFreq[i]);
 
     tft.setTextSize(2);
-    tft.setTextColor(conditionColor(propagationData.hfBandDay[i]));
+    uint16_t dayColor = conditionColor(propagationData.hfBandDay[i]);
+    if (isTftStyleLight()) {
+      dayColor = tftUiPalette.fg;
+    }
+    tft.setTextColor(dayColor);
     tft.setCursor(150, yPos - 2);
     tft.print(propagationData.hfBandDay[i]);
 
-    tft.setTextColor(conditionColor(propagationData.hfBandNight[i]));
+    uint16_t nightColor = conditionColor(propagationData.hfBandNight[i]);
+    if (isTftStyleLight()) {
+      nightColor = tftUiPalette.fg;
+    }
+    tft.setTextColor(nightColor);
     tft.setCursor(240, yPos - 2);
     tft.print(propagationData.hfBandNight[i]);
 
@@ -5854,17 +8700,17 @@ void drawBandInfoBody() {
   }
 
   tft.setTextSize(1);
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(tftUiPalette.muted);
   tft.setCursor(10, 190);
   tft.print("UPDATED UTC");
   tft.setTextSize(2);
-  tft.setTextColor(TFT_LIGHTGREY);
+  tft.setTextColor(tftUiPalette.fg);
   tft.setCursor(10, 202);
   tft.print(propagationData.updated.length() ? propagationData.updated : "--");
 
   if (!propagationData.valid) {
     tft.setTextSize(1);
-    tft.setTextColor(TFT_RED);
+    tft.setTextColor(isTftStyleLight() ? tftUiPalette.fg : TFT_RED);
     tft.setCursor(10, 176);
     String err = propagationData.lastError.length() ? propagationData.lastError : tr(TR_NO_DATA);
     tft.print(tr(TR_ERROR_PREFIX));
@@ -5890,7 +8736,7 @@ void updateScreen4Data() {
 }
 
 void drawBandInfo() {
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(tftUiPalette.bg);
 
   tft.fillRect(0, 0, 320, 32, TFT_RADIO_ORANGE);
   tft.setTextColor(TFT_BLACK);
@@ -5918,7 +8764,7 @@ void drawBandInfo() {
 
   tft.fillTriangle(10, 230, 20, 222, 20, 238, TFT_RADIO_ORANGE);
   tft.fillTriangle(310, 230, 300, 222, 300, 238, TFT_RADIO_ORANGE);
-  tft.setTextColor(0x52AA);
+  tft.setTextColor(isTftStyleLight() ? tftUiPalette.fg : 0x52AA);
   tft.setTextSize(1);
   tft.setCursor(125, 226);
   tft.print("SWITCH SCREEN");
@@ -5927,36 +8773,36 @@ void drawBandInfo() {
 bool fetchWeatherForecast(double lat, double lon);
 
 bool fetchWeatherData() {
-  if (WiFi.status() != WL_CONNECTED) {
-    weatherData.lastError = "WiFi offline";
+  auto markWeatherError = [&](const String &errorText) {
+    lockWeatherData();
+    weatherData.lastError = errorText;
     weatherData.valid = false;
+    unlockWeatherData();
     return false;
+  };
+
+  if (WiFi.status() != WL_CONNECTED) {
+    return markWeatherError("WiFi offline");
   }
   if (weatherApiKey.length() == 0) {
-    weatherData.lastError = "No API key";
-    weatherData.valid = false;
-    return false;
+    return markWeatherError("No API key");
   }
 
   double lat = 0.0;
   double lon = 0.0;
-  if (userLatLonValid) {
-    lat = userLat;
-    lon = userLon;
-  } else if (userLocator.length() >= 4) {
-    locatorToLatLon(userLocator, lat, lon);
-  } else {
-    weatherData.lastError = "No locator";
-    weatherData.valid = false;
-    return false;
+  if (!getServiceCoordinatesForServices(lat, lon)) {
+    return markWeatherError("No station coordinates");
   }
 
   // Reset prognoz przed nowym pobraniem
+  lockWeatherData();
   weatherData.forecast3hValid = false;
   weatherData.forecastNextDayValid = false;
+  weatherData.forecastError = "";
   for (uint8_t i = 0; i < WeatherData::DETAIL_COLS; i++) {
     weatherData.detailValid[i] = false;
   }
+  unlockWeatherData();
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -5969,17 +8815,13 @@ bool fetchWeatherData() {
   HTTPClient http;
   http.setTimeout(8000);
   if (!http.begin(client, url)) {
-    weatherData.lastError = "HTTP begin failed";
-    weatherData.valid = false;
-    return false;
+    return markWeatherError("HTTP begin failed");
   }
 
   int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK) {
-    weatherData.lastError = "HTTP " + String(httpCode);
-    weatherData.valid = false;
     http.end();
-    return false;
+    return markWeatherError("HTTP " + String(httpCode));
   }
 
   WiFiClient *stream = http.getStreamPtr();
@@ -6000,17 +8842,13 @@ bool fetchWeatherData() {
   DeserializationError err = deserializeJson(doc, *stream, DeserializationOption::Filter(filter));
   http.end();
   if (err) {
-    weatherData.lastError = "JSON error";
-    weatherData.valid = false;
-    return false;
+    return markWeatherError("JSON error");
   }
 
   int cod = doc["cod"] | 0;
   if (cod != 200) {
     String msg = doc["message"] | "";
-    weatherData.lastError = msg.length() ? msg : "API error";
-    weatherData.valid = false;
-    return false;
+    return markWeatherError(msg.length() ? msg : "API error");
   }
 
   String desc = doc["weather"][0]["description"] | "";
@@ -6027,6 +8865,7 @@ bool fetchWeatherData() {
     desc = "zachmurzenie";
   }
 
+  lockWeatherData();
   weatherData.description = desc.length() ? desc : "--";
   weatherData.cityName = cityName;
   weatherData.iconCode = icon;
@@ -6048,6 +8887,7 @@ bool fetchWeatherData() {
   weatherData.valid = true;
   weatherData.lastError = "";
   weatherData.fetchedAtMs = millis();
+  unlockWeatherData();
 
   // Prognozy (3h i jutro)
   fetchWeatherForecast(lat, lon);
@@ -6059,54 +8899,165 @@ bool fetchWeatherData() {
 }
 
 bool fetchWeatherForecast(double lat, double lon) {
-  if (WiFi.status() != WL_CONNECTED || weatherApiKey.length() == 0) {
+  auto setForecastError = [&](const String &errorText) {
+    lockWeatherData();
+    weatherData.forecastError = errorText;
+    unlockWeatherData();
     return false;
-  }
+  };
 
-  WiFiClientSecure client;
-  client.setInsecure();
+  auto formatForecastHttpError = [&](int code) {
+    String msg = "Forecast: HTTP " + String(code);
+    if (code < 0) {
+      msg += " (";
+      msg += HTTPClient::errorToString(code);
+      msg += ")";
+    }
+    return msg;
+  };
+
+  if (WiFi.status() != WL_CONNECTED) {
+    return setForecastError("Forecast: WiFi offline");
+  }
+  if (weatherApiKey.length() == 0) {
+    return setForecastError("Forecast: No API key");
+  }
 
   String langParam = (tftLanguage == TFT_LANG_EN) ? "en" : "pl";
-  String url = "https://api.openweathermap.org/data/2.5/forecast?lat=" +
-               String(lat, 4) + "&lon=" + String(lon, 4) +
-               "&appid=" + weatherApiKey + "&units=metric&lang=" + langParam + "&cnt=40";
+  String paramsWithLang = "lat=" + String(lat, 4) +
+                          "&lon=" + String(lon, 4) +
+                          "&appid=" + weatherApiKey +
+                          "&units=metric&lang=" + langParam;
+  String paramsNoLang = "lat=" + String(lat, 4) +
+                        "&lon=" + String(lon, 4) +
+                        "&appid=" + weatherApiKey +
+                        "&units=metric";
+
+  String urlPrimary = "https://api.openweathermap.org/data/2.5/forecast?" + paramsWithLang + "&cnt=24";
+  String urlRetrySecure = "https://api.openweathermap.org/data/2.5/forecast?" + paramsNoLang + "&cnt=12";
+  String urlRetryHttp = "http://api.openweathermap.org/data/2.5/forecast?" + paramsNoLang + "&cnt=12";
 
   HTTPClient http;
-  http.setTimeout(8000);
-  if (!http.begin(client, url)) {
-    return false;
+  int httpCode = 0;
+  String lastTransportError = "Forecast: HTTP begin failed";
+  bool requestReady = false;
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+  secureClient.setTimeout(12000);
+  WiFiClient plainClient;
+  plainClient.setTimeout(12000);
+
+  for (uint8_t attempt = 0; attempt < 3 && !requestReady; attempt++) {
+    bool secureAttempt = (attempt < 2);
+    String attemptUrl = (attempt == 0) ? urlPrimary : (attempt == 1 ? urlRetrySecure : urlRetryHttp);
+
+    http.setReuse(false);
+    http.useHTTP10(true);
+    http.setTimeout(attempt == 0 ? 8000 : 12000);
+
+    bool beginOk = secureAttempt ? http.begin(secureClient, attemptUrl)
+                                 : http.begin(plainClient, attemptUrl);
+    if (!beginOk) {
+      lastTransportError = "Forecast: HTTP begin failed";
+      continue;
+    }
+
+    httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+      requestReady = true;
+      break;
+    }
+
+    lastTransportError = formatForecastHttpError(httpCode);
+    http.end();
   }
 
-  int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    http.end();
-    return false;
+  if (!requestReady) {
+    return setForecastError(lastTransportError);
   }
 
   WiFiClient *stream = http.getStreamPtr();
 
-  DynamicJsonDocument filter(1024);
-  filter["list"][0]["dt"] = true;
-  filter["list"][0]["main"]["temp"] = true;
-  filter["list"][0]["main"]["humidity"] = true;
-  filter["list"][0]["wind"]["speed"] = true;
-  filter["list"][0]["weather"][0]["description"] = true;
-  filter["list"][0]["weather"][0]["id"] = true;
-  filter["list"][0]["weather"][0]["icon"] = true;
-  filter["city"]["name"] = true;
-
-  DynamicJsonDocument doc(16384);
-  DeserializationError err = deserializeJson(doc, *stream, DeserializationOption::Filter(filter));
+  DynamicJsonDocument doc(28672);
+  DeserializationError err = deserializeJson(doc, *stream);
   http.end();
   if (err) {
-    return false;
+    return setForecastError("Forecast: JSON " + String(err.c_str()));
+  }
+
+  String cod = doc["cod"] | "";
+  if (cod.length() > 0 && cod != "200") {
+    String msg = doc["message"] | "";
+    if (msg.length() == 0) {
+      msg = "API error";
+    }
+    return setForecastError("Forecast: " + msg);
   }
 
   JsonArray list = doc["list"].as<JsonArray>();
   if (list.isNull() || list.size() == 0) {
-    return false;
+    int cntApi = doc["cnt"] | -1;
+    if (cntApi >= 0) {
+      return setForecastError("Forecast: No data in API (cnt=" + String(cntApi) + ")");
+    }
+    return setForecastError("Forecast: No data in API");
   }
 
+  bool stormPossible = false;
+  int nearestStormEtaMinutes = 0;
+  bool windPossible = false;
+  float maxWindMsNext6h = 0.0f;
+  float maxWindGustMsNext6h = 0.0f;
+  long nowUnixForAlerts = (long)time(nullptr);
+  if (nowUnixForAlerts > 100000L) {
+    for (JsonObject entry : list) {
+      long dt = entry["dt"] | 0L;
+      if (dt <= 0L) {
+        continue;
+      }
+
+      long deltaSec = dt - nowUnixForAlerts;
+      if (deltaSec < 0L || deltaSec > (6L * 3600L)) {
+        continue;
+      }
+
+      float windMs = entry["wind"]["speed"] | 0.0f;
+      float windGustMs = entry["wind"]["gust"] | 0.0f;
+      if (windMs > maxWindMsNext6h) {
+        maxWindMsNext6h = windMs;
+      }
+      if (windGustMs > maxWindGustMsNext6h) {
+        maxWindGustMsNext6h = windGustMs;
+      }
+
+      int weatherId = entry["weather"][0]["id"] | 800;
+      if (weatherId >= 200 && weatherId < 300) {
+        int etaMinutes = (int)(deltaSec / 60L);
+        if ((deltaSec % 60L) != 0L) {
+          etaMinutes++;
+        }
+        if (etaMinutes < 1) {
+          etaMinutes = 1;
+        }
+        if (!stormPossible || etaMinutes < nearestStormEtaMinutes) {
+          stormPossible = true;
+          nearestStormEtaMinutes = etaMinutes;
+        }
+      }
+    }
+
+    windPossible = (maxWindMsNext6h >= weatherAlertWindThresholdMs) ||
+             (maxWindGustMsNext6h >= weatherAlertWindGustThresholdMs());
+  }
+
+  updateWeatherAlertForecastState(stormPossible,
+                                  nearestStormEtaMinutes,
+                                  windPossible,
+                                  maxWindMsNext6h,
+                                  maxWindGustMsNext6h);
+
+  lockWeatherData();
   if (weatherData.cityName.length() == 0) {
     String cityFromForecast = doc["city"]["name"] | "";
     if (cityFromForecast.length() > 0) {
@@ -6122,8 +9073,8 @@ bool fetchWeatherForecast(double lat, double lon) {
     48L * 3600L,
     72L * 3600L
   };
-  const int fallbackIdx[WeatherData::DETAIL_COLS] = {0, 1, 8, 16, 24};
-  const long timezoneOffsetSec = (long)timezoneHours * 3600L;
+  const int fallbackIdx[WeatherData::DETAIL_COLS] = {0, 1, 7, 15, 23};
+  const long timezoneOffsetSec = (long)(timezoneHours * 3600.0f);
   const long nowLocalUnix = nowUnix + timezoneOffsetSec;
   const long baseLocalDayStart = (nowLocalUnix / 86400L) * 86400L;
 
@@ -6280,6 +9231,15 @@ bool fetchWeatherForecast(double lat, double lon) {
     }
   }
 
+  if (!anyDetailValid) {
+    weatherData.forecastError = "Forecast: No usable entries";
+  }
+
+  if (anyDetailValid) {
+    weatherData.forecastError = "";
+  }
+
+  unlockWeatherData();
   return anyDetailValid;
 }
 
@@ -6332,8 +9292,10 @@ bool fetchAirPollutionData(double lat, double lon) {
     return false;
   }
 
+  lockWeatherData();
   weatherData.pm25 = components["pm2_5"] | 0.0f;
   weatherData.pm10 = components["pm10"] | 0.0f;
+  unlockWeatherData();
   return true;
 }
 
@@ -6391,7 +9353,13 @@ uint32_t computeScreen5Signature() {
   hash ^= footerVisible ? 1u : 0u;
   hash *= fnvPrime;
 
-  const String* fields[] = {&weatherData.cityName, &weatherData.description, &weatherData.updated, &weatherData.lastError};
+  const String* fields[] = {
+    &weatherData.cityName,
+    &weatherData.description,
+    &weatherData.updated,
+    &weatherData.lastError,
+    &weatherData.forecastError
+  };
   for (const String* field : fields) {
     for (size_t j = 0; j < field->length(); j++) {
       hash ^= (uint8_t)(*field)[j];
@@ -6500,9 +9468,18 @@ String weatherIconPathForId(int id, bool isNight) {
   return base + "unknown.bmp";
 }
 
+static String weatherIconPathWithLightSuffix(const String &iconPath) {
+  int dotIdx = iconPath.lastIndexOf('.');
+  if (dotIdx <= 0) {
+    return iconPath + "w";
+  }
+  return iconPath.substring(0, dotIdx) + "w" + iconPath.substring(dotIdx);
+}
+
 // Funkcja pomocnicza: Rysowanie ikon pogodowych (priorytet: id -> plik BMP, fallback: opis)
 void drawWeatherIcon(int x, int y, int weatherId, String desc) {
   desc.toLowerCase();
+  const bool lightTheme = isTftStyleLight();
 
   // Dzień/noc z ikony OWM (np. 10d/10n). Jeśli brak, fallback na czas lokalny.
   bool isNight = false;
@@ -6518,6 +9495,13 @@ void drawWeatherIcon(int x, int y, int weatherId, String desc) {
   }
 
   String iconFile = weatherIconPathForId(weatherId, isNight);
+
+  if (lightTheme) {
+    String iconFileLight = weatherIconPathWithLightSuffix(iconFile);
+    if (drawBmpFromFS(iconFileLight, x - 25, y - 25)) {
+      return;
+    }
+  }
 
   // Najpierw próbujemy gotową ikonę BMP
   if (drawBmpFromFS(iconFile, x - 25, y - 25)) {
@@ -6581,12 +9565,17 @@ void drawWeatherIcon(int x, int y, int weatherId, String desc) {
 void drawWeatherBody() {
   const int bodyTop = 32;
   const int bodyBottom = 220;
+  const bool lightTheme = isTftStyleLight();
+  const uint16_t bodyBg = lightTheme ? TFT_WHITE : TFT_BLACK;
+  const uint16_t bodyText = lightTheme ? TFT_BLACK : TFT_WHITE;
+  const uint16_t bodyMuted = lightTheme ? TFT_BLACK : TFT_DARKGREY;
+  const uint16_t bodySecondary = lightTheme ? TFT_BLACK : TFT_LIGHTGREY;
   
   // Czyszczenie obszaru roboczego
-  tft.fillRect(0, bodyTop, 320, bodyBottom - bodyTop, TFT_BLACK);
+  tft.fillRect(0, bodyTop, 320, bodyBottom - bodyTop, bodyBg);
 
   if (!weatherData.valid) {
-    tft.setTextColor(TFT_RED);
+    tft.setTextColor(lightTheme ? TFT_BLACK : TFT_RED);
     tft.setTextSize(2);
     tft.setCursor(50, 110);
     tft.print("WAITING FOR DATA...");
@@ -6596,48 +9585,52 @@ void drawWeatherBody() {
   // 1. IKONA I OPIS (Prawa strona)
   drawWeatherIcon(240, 70, weatherData.weatherId, weatherData.description);
 
-  // Opis pogody z polskimi znakami, czcionka VLW 20px
-  bool fontLoaded = false;
+  // Priorytet: smooth font (VLW) dla polskich znaków, fallback ASCII gdy mało pamięci.
   int descY = 105; // shifted up by 10px
   int descX = 240; // shifted left by 10px
-  if (littleFsReady && LittleFS.exists(ROBOTO_FONT12_FILE)) {
-    tft.loadFont(ROBOTO_FONT12_NAME, LittleFS);
-    fontLoaded = true;
-    tft.setTextColor(TFT_LIGHTGREY);
+  bool smoothFontUsed = false;
+  if (tryLoadSmoothFont(ROBOTO_FONT12_NAME, ROBOTO_FONT12_FILE)) {
+    smoothFontUsed = true;
+    tft.setTextColor(bodySecondary);
     tft.setTextDatum(MC_DATUM);
     tft.drawString(weatherData.description, descX, descY);
-     tft.setCursor(15, 120);
+    tft.setTextDatum(TL_DATUM);
+
+    tft.setCursor(15, 120);
     tft.print(tr(TR_HUMIDITY));
-     tft.setCursor(15, 144);
+    tft.setCursor(15, 144);
     tft.print(tr(TR_PRESSURE));
-     tft.setCursor(15, 168);
+    tft.setCursor(15, 168);
     tft.print(tr(TR_WIND));
     tft.unloadFont();
-  } else {
+  }
+
+  if (!smoothFontUsed) {
     tft.setTextSize(1);
-    tft.setTextColor(TFT_LIGHTGREY);
+    tft.setTextColor(bodySecondary);
     String descAscii = sanitizePolishToAscii(weatherData.description);
     int fallbackX = descX - (descAscii.length() * 3);
     tft.setCursor(fallbackX, descY);
     tft.print(descAscii);
+
     tft.setTextSize(1);
-    tft.setTextColor(TFT_DARKGREY);
+    tft.setTextColor(bodyMuted);
     tft.setCursor(15, 120);
     tft.print(tr(TR_HUMIDITY));
-     tft.setCursor(15, 145);
+    tft.setCursor(15, 145);
     tft.print(tr(TR_PRESSURE));
-     tft.setCursor(15, 1705);
+    tft.setCursor(15, 170);
     tft.print(tr(TR_WIND));
   }
 
   // 2. TEMPERATURA (Lewa strona)
   tft.setTextSize(2);
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(bodyMuted);
   tft.setCursor(15, 45);
   tft.print(tr(TR_TEMPERATURE));
 
   tft.setTextSize(5);
-  tft.setTextColor(TFT_CYAN);
+  tft.setTextColor(lightTheme ? TFT_BLACK : TFT_CYAN);
   tft.setCursor(15, 70);
   tft.print(String(weatherData.tempC, 1));
   tft.setTextSize(2);
@@ -6648,11 +9641,11 @@ void drawWeatherBody() {
   
   // WILGOTNOĹšÄ† (z paskiem postÄ™pu)
   tft.setTextSize(1);
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(bodyMuted);
   //tft.setCursor(15, startY);
   //tft.print("WILGOTNOSC");
   tft.setTextSize(2);
-  tft.setTextColor(TFT_WHITE);
+  tft.setTextColor(bodyText);
   tft.setCursor(110, startY - 5);
   tft.print(String(weatherData.humidity) + "%");
   
@@ -6663,21 +9656,21 @@ void drawWeatherBody() {
 
   // CIĹšNIENIE
   tft.setTextSize(1);
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(bodyMuted);
   //tft.setCursor(15, startY + 25);
   //tft.print("CIŚNIENIE");
   tft.setTextSize(2);
-  tft.setTextColor(TFT_WHITE);
+  tft.setTextColor(bodyText);
   tft.setCursor(110, startY + 20);
   tft.print(String(weatherData.pressure) + " hPa");
 
   // WIATR (Dynamiczny kolor bez paska)
   tft.setTextSize(1);
-  tft.setTextColor(TFT_DARKGREY);
+  tft.setTextColor(bodyMuted);
   //tft.setCursor(15, startY + 50);
   //tft.print("WIATR");
   tft.setTextSize(2);
-  tft.setTextColor(getWindColor(weatherData.windMs)); // Dynamiczny kolor!
+  tft.setTextColor(lightTheme ? TFT_BLACK : getWindColor(weatherData.windMs));
   tft.setCursor(110, startY + 45);
   tft.print(String(weatherData.windMs, 1) + " m/s");
 
@@ -6685,23 +9678,24 @@ void drawWeatherBody() {
   tft.setTextSize(2);
   
   // PM2.5
-  tft.setTextColor(TFT_WHITE);
+  tft.setTextColor(bodyText);
   tft.setCursor(15, startY + 70);
   tft.print("PM2.5: ");
   uint16_t pm25Color = getPM25Color(weatherData.pm25);
-  tft.setTextColor(pm25Color);
+  tft.setTextColor(lightTheme ? TFT_BLACK : pm25Color);
   tft.print(String(weatherData.pm25, 1));
   
   // Przerwa i PM10
-  tft.setTextColor(TFT_WHITE);
+  tft.setTextColor(bodyText);
   tft.print("  PM10: ");
   uint16_t pm10Color = getPM10Color(weatherData.pm10);
-  tft.setTextColor(pm10Color);
+  tft.setTextColor(lightTheme ? TFT_BLACK : pm10Color);
   tft.print(String(weatherData.pm10, 1));
 
 }
 
 static void drawWeatherDetailIconCell(int x, int y, int weatherId, const String &iconCode) {
+  const bool lightTheme = isTftStyleLight();
   bool isNight = false;
   if (iconCode.endsWith("n")) {
     isNight = true;
@@ -6715,8 +9709,14 @@ static void drawWeatherDetailIconCell(int x, int y, int weatherId, const String 
   }
 
   String iconFile = weatherIconPathForId(weatherId, isNight);
+  if (lightTheme) {
+    String iconFileLight = weatherIconPathWithLightSuffix(iconFile);
+    if (drawBmpFromFS(iconFileLight, x - 14, y - 14)) {
+      return;
+    }
+  }
   if (!drawBmpFromFS(iconFile, x - 14, y - 14)) {
-    tft.drawCircle(x, y, 10, TFT_LIGHTGREY);
+    tft.drawCircle(x, y, 10, lightTheme ? TFT_BLACK : TFT_LIGHTGREY);
   }
 }
 
@@ -6748,14 +9748,50 @@ void drawWeatherDetailPage() {
   const int bodyRight = 318;
   const int colCount = WeatherData::DETAIL_COLS - 1;
   const int colW = (bodyRight - bodyLeft + 1) / colCount;
+  const bool lightTheme = isTftStyleLight();
+  const uint16_t bodyBg = lightTheme ? TFT_WHITE : TFT_BLACK;
+  const uint16_t bodyText = lightTheme ? TFT_BLACK : TFT_WHITE;
+  const uint16_t bodySecondary = lightTheme ? TFT_BLACK : TFT_LIGHTGREY;
+  const uint16_t bodyMuted = lightTheme ? TFT_BLACK : TFT_DARKGREY;
+  const uint16_t rowBg = lightTheme ? 0xDEFB : TFT_TABLE_ALT_ROW_COLOR;
 
-  tft.fillRect(0, bodyTop, 320, bodyBottom - bodyTop, TFT_BLACK);
+  tft.fillRect(0, bodyTop, 320, bodyBottom - bodyTop, bodyBg);
 
   if (!weatherData.valid) {
-    tft.setTextColor(TFT_RED);
+    tft.setTextColor(lightTheme ? TFT_BLACK : TFT_RED);
     tft.setTextSize(2);
     tft.setCursor(12, 96);
     tft.print(weatherData.lastError.length() ? weatherData.lastError : tr(TR_NO_DATA));
+    return;
+  }
+
+  bool anyDetailValid = false;
+  for (uint8_t i = 0; i < WeatherData::DETAIL_COLS; i++) {
+    if (weatherData.detailValid[i]) {
+      anyDetailValid = true;
+      break;
+    }
+  }
+
+  if (!anyDetailValid) {
+    tft.setTextColor(lightTheme ? TFT_BLACK : TFT_YELLOW);
+    tft.setTextSize(2);
+    tft.setCursor(12, 84);
+    tft.print((tftLanguage == TFT_LANG_EN) ? "No forecast" : "Brak prognozy");
+
+    String err = weatherData.forecastError;
+    if (err.length() == 0) {
+      err = (tftLanguage == TFT_LANG_EN) ? "Forecast: no data from API" : "Prognoza: brak danych z API";
+    }
+    const int maxChars = 42;
+    if ((int)err.length() > maxChars) {
+      err = err.substring(0, maxChars - 3) + "...";
+    }
+
+    tft.setTextColor(bodySecondary);
+    tft.setTextSize(1);
+    tft.setCursor(12, 110);
+    tft.print(err);
     return;
   }
 
@@ -6769,11 +9805,11 @@ void drawWeatherDetailPage() {
   const int yWind = 152;
   const int yIcon = 183;
 
-  tft.fillRect(bodyLeft, bodyTop + 2, bodyRight - bodyLeft + 1, 31, TFT_TABLE_ALT_ROW_COLOR);
+  tft.fillRect(bodyLeft, bodyTop + 2, bodyRight - bodyLeft + 1, 31, rowBg);
 
   for (int i = 1; i < colCount; i++) {
     int vx = bodyLeft + i * colW;
-    tft.drawFastVLine(vx, bodyTop + 2, bodyBottom - bodyTop - 4, TFT_DARKGREY);
+    tft.drawFastVLine(vx, bodyTop + 2, bodyBottom - bodyTop - 4, bodyMuted);
   }
 
   for (int i = 0; i < colCount; i++) {
@@ -6783,14 +9819,14 @@ void drawWeatherDetailPage() {
     String hdr = sanitizePolishToAscii(headers[i]);
     tft.setTextSize(2);
     int hdrW = hdr.length() * 12;
-    tft.setTextColor(TFT_LIGHTGREY);
+    tft.setTextColor(bodySecondary);
     tft.setCursor(cx - hdrW / 2, yHeader);
     tft.print(hdr);
 
     tft.setTextSize(1);
 
     if (!weatherData.detailValid[i]) {
-      tft.setTextColor(TFT_DARKGREY);
+      tft.setTextColor(bodyMuted);
       tft.setCursor(cx - 6, yTemp);
       tft.print("--");
       tft.setCursor(cx - 6, yNight);
@@ -6807,14 +9843,14 @@ void drawWeatherDetailPage() {
     String windText = String(weatherData.detailWindMs[i], 1) + "m/s";
 
     tft.setTextSize(2);
-    tft.setTextColor(TFT_CYAN);
+    tft.setTextColor(lightTheme ? TFT_BLACK : TFT_CYAN);
     int tempX = cx - ((int)tempText.length() * 6);
     tft.setCursor(tempX, yTemp);
     tft.print(tempText);
-    tft.drawCircle(tempX + ((int)tempText.length() * 12) + 3, yTemp + 3, 2, TFT_CYAN);
+    tft.drawCircle(tempX + ((int)tempText.length() * 12) + 3, yTemp + 3, 2, lightTheme ? TFT_BLACK : TFT_CYAN);
 
     tft.setTextSize(1);
-    tft.setTextColor(TFT_LIGHTGREY);
+    tft.setTextColor(bodySecondary);
     String nightText = "--";
     if (i >= 2 && i <= 3 && weatherData.nightTempValid[i - 2]) {
       nightText = String(weatherData.nightTempC[i - 2], 1) + "C";
@@ -6823,12 +9859,12 @@ void drawWeatherDetailPage() {
     tft.print(nightText);
 
     tft.setTextSize(2);
-    tft.setTextColor(TFT_WHITE);
+  tft.setTextColor(bodyText);
     tft.setCursor(cx - ((int)humText.length() * 6), yHum);
     tft.print(humText);
 
     tft.setTextSize(1);
-    tft.setTextColor(getWindColor(weatherData.detailWindMs[i]));
+  tft.setTextColor(lightTheme ? TFT_BLACK : getWindColor(weatherData.detailWindMs[i]));
     tft.setCursor(cx - ((int)windText.length() * 3), yWind);
     tft.print(windText);
 
@@ -6837,7 +9873,8 @@ void drawWeatherDetailPage() {
 }
 
 static void drawWeatherFooterArea(ScreenType screenId) {
-  tft.fillRect(0, 220, 320, 20, TFT_BLACK);
+  const bool lightTheme = isTftStyleLight();
+  tft.fillRect(0, 220, 320, 20, lightTheme ? TFT_WHITE : TFT_BLACK);
 
   if (isTableNavFooterVisible(screenId)) {
     drawSwitchScreenFooter();
@@ -6864,7 +9901,7 @@ static void drawWeatherFooterArea(ScreenType screenId) {
   }
   String footerLabel = prefix + cityLabel;
 
-  tft.setTextColor(0x52AA);
+  tft.setTextColor(lightTheme ? TFT_BLACK : 0x52AA);
   tft.setTextSize(1);
   int footerWidth = footerLabel.length() * 6;
   int footerX = (320 - footerWidth) / 2;
@@ -6886,34 +9923,38 @@ void updateScreen5Data() {
 
   static uint32_t lastWeatherSig = 0;
   static uint32_t lastForecastSig = 0;
+
+  lockWeatherData();
   uint32_t currentSig = computeScreen5Signature();
 
   if (currentScreen == SCREEN_WEATHER_FORECAST) {
     if (currentSig == lastForecastSig) {
+      unlockWeatherData();
       return;
     }
     lastForecastSig = currentSig;
     drawWeatherDetailPage();
     drawWeatherFooterArea(SCREEN_WEATHER_FORECAST);
+    unlockWeatherData();
     return;
   }
 
   if (currentSig == lastWeatherSig) {
+    unlockWeatherData();
     return;
   }
   lastWeatherSig = currentSig;
 
   drawWeatherBody();
   drawWeatherFooterArea(SCREEN_WEATHER_DSP);
+  unlockWeatherData();
 }
 
 void drawWeather() {
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(isTftStyleLight() ? TFT_WHITE : TFT_BLACK);
 
   tft.fillRect(0, 0, 320, 32, TFT_RADIO_ORANGE);
   tft.setTextColor(TFT_BLACK);
-
-  drawHamburgerMenuButton3D(5, 7);
 
   tft.setTextSize(2);
   tft.setCursor(35, 8);
@@ -6928,17 +9969,17 @@ void drawWeather() {
     tft.print(timeBuffer);
   }
 
+  lockWeatherData();
   drawWeatherBody();
   drawWeatherFooterArea(SCREEN_WEATHER_DSP);
+  unlockWeatherData();
 }
 
 void drawWeatherForecast() {
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(isTftStyleLight() ? TFT_WHITE : TFT_BLACK);
 
   tft.fillRect(0, 0, 320, 32, TFT_RADIO_ORANGE);
   tft.setTextColor(TFT_BLACK);
-
-  drawHamburgerMenuButton3D(5, 7);
 
   const char *detailHeader = (tftLanguage == TFT_LANG_EN) ? "Weather forecast" : "Prognoza pogody";
   tft.setTextSize(2);
@@ -6954,8 +9995,10 @@ void drawWeatherForecast() {
     tft.print(timeBuffer);
   }
 
+  lockWeatherData();
   drawWeatherDetailPage();
   drawWeatherFooterArea(SCREEN_WEATHER_FORECAST);
+  unlockWeatherData();
 }
 
 void setupMatrix() {
@@ -7150,7 +10193,6 @@ void drawMatrixClock() {
   if (!matrixInitialized) {
     setupMatrix();
   }
-  prepareMatrixIntro();
   drawMatrixStatic();
   screen10NeedsRedraw = false;
   lastScreen10UpdateMs = millis();
@@ -7911,22 +10953,24 @@ static uint32_t readBmp32(fs::File &f) {
 }
 
 static bool drawBmpFromFS(const String &filename, int16_t x, int16_t y) {
+  bool oldSwap = false;
+  bool swapChanged = false;
+  try {
   if (!littleFsReady) {
     return false;
   }
   if ((x >= tft.width()) || (y >= tft.height())) {
     return false;
   }
-  if (!LittleFS.exists(filename)) {
-    return false;
-  }
-  fs::File bmpFS = LittleFS.open(filename, "r");
+  // Nie sprawdzaj exists() osobno: to robi dodatkowe fopen() i bywa niestabilne
+  // po update frameworku; bezpieczniej jest od razu próbować open().
+  fs::File bmpFS = LittleFS.open(filename.c_str(), "r");
   if (!bmpFS) {
     return false;
   }
 
   uint32_t seekOffset;
-  uint16_t w, h;
+  int32_t w, h;
   if (readBmp16(bmpFS) != 0x4D42) {
     bmpFS.close();
     return false;
@@ -7939,35 +10983,80 @@ static bool drawBmpFromFS(const String &filename, int16_t x, int16_t y) {
   w = readBmp32(bmpFS);
   h = readBmp32(bmpFS);
 
-  if (readBmp16(bmpFS) != 1 || readBmp16(bmpFS) != 24 || readBmp32(bmpFS) != 0) {
+  uint16_t planes = readBmp16(bmpFS);
+  uint16_t bpp = readBmp16(bmpFS);
+  uint32_t compression = readBmp32(bmpFS);
+
+  // Support classic 24-bit BMP (weather icons) and 32-bit BMP (e.g. startup logo).
+  bool bmp24 = (bpp == 24 && compression == 0);
+  bool bmp32 = (bpp == 32 && (compression == 0 || compression == 3));
+  if (planes != 1 || (!bmp24 && !bmp32) || w <= 0 || h == 0) {
     bmpFS.close();
     return false;
   }
 
-  y += h - 1;
-  bool oldSwap = tft.getSwapBytes();
+  int32_t absH = (h > 0) ? h : -h;
+  // Twarde limity dla ikon/tła na tym TFT, by nie ryzykować uszkodzenia stosu.
+  if (w > 320 || absH > 320) {
+    bmpFS.close();
+    return false;
+  }
+
+  bool bottomUp = (h > 0);
+  if (bottomUp) {
+    y += (int16_t)(absH - 1);
+  }
+
+  oldSwap = tft.getSwapBytes();
   tft.setSwapBytes(true);
+  swapChanged = true;
   bmpFS.seek(seekOffset);
 
-  uint16_t padding = (4 - ((w * 3) & 3)) & 3;
-  uint8_t lineBuffer[w * 3 + padding];
+  const uint8_t bytesPerPixel = bmp32 ? 4 : 3;
+  uint16_t padding = (4 - (((uint32_t)w * bytesPerPixel) & 3)) & 3;
+  uint32_t rowSize = (uint32_t)w * bytesPerPixel + padding;
+  if (rowSize == 0 || rowSize > 2048) {
+    tft.setSwapBytes(oldSwap);
+    bmpFS.close();
+    return false;
+  }
+  static uint8_t lineBuffer[2048];
 
-  for (uint16_t row = 0; row < h; row++) {
-    bmpFS.read(lineBuffer, sizeof(lineBuffer));
+  for (int32_t row = 0; row < absH; row++) {
+    if (bmpFS.read(lineBuffer, rowSize) != (int)rowSize) {
+      tft.setSwapBytes(oldSwap);
+      bmpFS.close();
+      return false;
+    }
     uint8_t *bptr = lineBuffer;
     uint16_t *tptr = (uint16_t *)lineBuffer;
-    for (uint16_t col = 0; col < w; col++) {
+    for (int32_t col = 0; col < w; col++) {
       uint8_t b = *bptr++;
       uint8_t g = *bptr++;
       uint8_t r = *bptr++;
+      if (bmp32) {
+        bptr++; // Skip alpha/extra byte.
+      }
       *tptr++ = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
     }
-    tft.pushImage(x, y--, w, 1, (uint16_t *)lineBuffer);
+    if (bottomUp) {
+      tft.pushImage(x, y--, (uint16_t)w, 1, (uint16_t *)lineBuffer);
+    } else {
+      tft.pushImage(x, y + (int16_t)row, (uint16_t)w, 1, (uint16_t *)lineBuffer);
+    }
   }
 
   tft.setSwapBytes(oldSwap);
+  swapChanged = false;
   bmpFS.close();
   return true;
+  } catch (...) {
+    if (swapChanged) {
+      tft.setSwapBytes(oldSwap);
+    }
+    Serial.println("[BMP] Wyjatek podczas odczytu ikony BMP - pomijam rysowanie");
+    return false;
+  }
 }
 
 // ZwrĂłÄ‡ surowy symbol APRS jako 2 znaki (table + code)
@@ -8004,6 +11093,7 @@ String getAPRSSymbolShort(const APRSStation &station) {
   if (raw == "/k") return "TRUCK";
   if (raw == "/u") return "TRUCK";
   if (raw == "/v") return "VAN";
+  if (raw == "/V") return "HAMCLOCK";
   if (raw == "/p") return "ROVER";
   if (raw == "/o") return "EOC";
   if (raw == "/t") return "TRKSTOP";
@@ -8386,6 +11476,7 @@ static void dismissAprsAlertScreen() {
     return;
   }
   aprsAlertScreenActive = false;
+  activeAlertScreenKind = ALERT_SCREEN_NONE;
   drawScreen(currentScreen);
   if (currentScreen == SCREEN_HAM_CLOCK) {
     updateScreen1();
@@ -8480,6 +11571,7 @@ void ALERT_Screen(const APRSStation &station) {
 
   aprsAlertScreenStation = station;
   aprsAlertScreenActive = true;
+  activeAlertScreenKind = ALERT_SCREEN_APRS;
   aprsAlertScreenUntilMs = millis() + ((unsigned long)aprsAlertScreenSeconds * 1000UL);
   aprsAlertFrameLastToggleMs = millis();
   aprsAlertFramePulseOn = true;
@@ -8539,9 +11631,11 @@ void ALERT_Screen(const APRSStation &station) {
   const int compassR = 24;
   bool hasBearing = false;
   float bearingDeg = 0.0f;
-  if (userLatLonValid && station.hasLatLon) {
+  double userLatForBearing = 0.0;
+  double userLonForBearing = 0.0;
+  if (station.hasLatLon && getServiceCoordinatesForServices(userLatForBearing, userLonForBearing)) {
     hasBearing = true;
-    bearingDeg = calculateBearing(userLat, userLon, (double)station.lat, (double)station.lon);
+    bearingDeg = calculateBearing(userLatForBearing, userLonForBearing, (double)station.lat, (double)station.lon);
   }
   drawAprsAlertCompass(compassX, compassY, compassR, hasBearing, bearingDeg);
 
@@ -8617,8 +11711,7 @@ void ALERT_Screen(const APRSStation &station) {
 
     int tempLabelW = (int)labelTempWithColon.length() * 6;
     int humidityLabelW = (int)labelHumidityWithColon.length() * 6;
-    if (littleFsReady && LittleFS.exists(ROBOTO_FONT12_FILE)) {
-      tft.loadFont(ROBOTO_FONT12_NAME, LittleFS);
+    if (tryLoadSmoothFont(ROBOTO_FONT12_NAME, ROBOTO_FONT12_FILE)) {
       tft.setTextDatum(TL_DATUM);
       tft.setTextColor(TFT_WHITE);
       tft.drawString(labelTempWithColon, leftColX, weatherLabelRowY);
@@ -8697,6 +11790,205 @@ void ALERT_Screen(const APRSStation &station) {
     tft.setTextSize(2);
     drawAprsAlertWrappedComment(station.comment, 20, 184, 280, 2, 2);
   }
+}
+
+void APRS_BEACONING_Screen(const String &txCallsign, const String &positionInfo, const String &pathInfo, const String &frameInfo) {
+  if (!tftInitialized || brightnessMenuActive) {
+    return;
+  }
+
+  aprsAlertScreenActive = true;
+  activeAlertScreenKind = ALERT_SCREEN_BEACONING;
+  aprsAlertScreenUntilMs = millis() + APRS_BEACONING_SCREEN_MS;
+  aprsAlertFrameLastToggleMs = millis();
+  aprsAlertFramePulseOn = true;
+
+  tft.fillScreen(TFT_BLACK);
+  tft.fillRect(0, 0, 320, 40, TFT_RADIO_ORANGE);
+  tft.drawFastHLine(0, 39, 320, 0x8410);
+
+  tft.setTextColor(TFT_BLACK);
+  tft.setTextSize(2);
+  const String headerText = "APRS BECONING...";
+  int headerX = (320 - ((int)headerText.length() * 12)) / 2;
+  if (headerX < 4) {
+    headerX = 4;
+  }
+  tft.setCursor(headerX, 12);
+  tft.print(headerText);
+  tft.setCursor(headerX + 1, 12);
+  tft.print(headerText);
+  drawAprsAlertCloseButton();
+
+  drawAprsAlertFrame(aprsAlertFramePulseOn);
+
+  String callsign = txCallsign;
+  callsign.toUpperCase();
+  if (callsign.length() == 0) {
+    callsign = "-";
+  }
+
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(3);
+  int callX = (320 - ((int)callsign.length() * 18)) / 2;
+  if (callX < 14) {
+    callX = 14;
+  }
+  tft.setCursor(callX, 62);
+  tft.print(callsign);
+
+  tft.setTextColor(TFT_CYAN);
+  tft.setTextSize(2);
+  int posX = (320 - ((int)positionInfo.length() * 12)) / 2;
+  if (posX < 12) {
+    posX = 12;
+  }
+  tft.setCursor(posX, 96);
+  tft.print(positionInfo);
+
+  String pathLine = "PATH: " + pathInfo;
+  tft.setTextColor(TFT_RADIO_ORANGE);
+  tft.setTextSize(2);
+  int pathX = (320 - ((int)pathLine.length() * 12)) / 2;
+  if (pathX < 12) {
+    pathX = 12;
+  }
+  tft.setCursor(pathX, 122);
+  tft.print(pathLine);
+
+  tft.setTextColor(TFT_CYAN);
+  tft.setTextSize(1);
+  tft.setCursor(20, 148);
+  tft.print("Frame:");
+  tft.setTextColor(TFT_LIGHTGREY);
+  tft.setTextSize(1);
+  drawAprsAlertWrappedComment(frameInfo, 20, 160, 280, 6, 1);
+}
+
+void WEATHER_ALERT_Screen(const WeatherAlertInfo &info) {
+  if (!tftInitialized) {
+    return;
+  }
+
+  weatherAlertScreenInfo = info;
+  aprsAlertScreenActive = true;
+  activeAlertScreenKind = ALERT_SCREEN_WEATHER;
+  aprsAlertScreenUntilMs = millis() + ((unsigned long)aprsAlertScreenSeconds * 1000UL);
+  aprsAlertFrameLastToggleMs = millis();
+  aprsAlertFramePulseOn = true;
+
+  tft.fillScreen(TFT_BLACK);
+  tft.fillRect(0, 0, 320, 40, TFT_RADIO_ORANGE);
+  tft.drawFastHLine(0, 39, 320, 0x8410);
+
+  tft.setTextColor(TFT_BLACK);
+  tft.setTextSize(2);
+  String headerText = (tftLanguage == TFT_LANG_EN) ? "WEATHER ALERT" : "ALERT POGODOWY";
+  int headerX = (320 - ((int)headerText.length() * 12)) / 2;
+  if (headerX < 6) {
+    headerX = 6;
+  }
+  tft.setCursor(headerX, 12);
+  tft.print(headerText);
+  tft.setCursor(headerX + 1, 12);
+  tft.print(headerText);
+  drawAprsAlertCloseButton();
+
+  drawAprsAlertFrame(aprsAlertFramePulseOn);
+
+  const String iconPath = info.stormPossible ? "/icon50/200.bmp" : "/icon50/wind.bmp";
+  drawBmpFromFS(iconPath, 18, 78);
+
+  int line2Y = 104;
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(3);
+  if (info.stormPossible) {
+    String stormLine1 = (tftLanguage == TFT_LANG_EN) ? "POSSIBLE" : "MOZLIWA";
+    String stormLine2 = (tftLanguage == TFT_LANG_EN) ? "STORM" : "BURZA";
+
+    int stormX1 = (320 - ((int)stormLine1.length() * 18)) / 2;
+    int stormX2 = (320 - ((int)stormLine2.length() * 18)) / 2;
+    if (stormX1 < 72) {
+      stormX1 = 72;
+    }
+    if (stormX2 < 72) {
+      stormX2 = 72;
+    }
+    tft.setCursor(stormX1, 62);
+    tft.print(stormLine1);
+    tft.setCursor(stormX2, 90);
+    tft.print(stormLine2);
+    line2Y = 120;
+  } else {
+    String mainLine = (tftLanguage == TFT_LANG_EN) ? "STRONG WIND" : "SILNY WIATR";
+    int mainX = (320 - ((int)mainLine.length() * 18)) / 2;
+    if (mainX < 72) {
+      mainX = 72;
+    }
+    tft.setCursor(mainX, 68);
+    tft.print(mainLine);
+  }
+
+  String line2;
+  if (info.stormPossible) {
+    if (info.stormNow) {
+      line2 = (tftLanguage == TFT_LANG_EN) ? "STORM NOW" : "BURZA TERAZ";
+    } else {
+      line2 = (tftLanguage == TFT_LANG_EN)
+                ? ("ETA<=" + String(info.stormEtaHours) + " h")
+                : ("ETA<= " + String(info.stormEtaHours) + "godz");
+    }
+  } else {
+    line2 = (tftLanguage == TFT_LANG_EN) ? "Forecast <= 6h" : "Prognoza <= 6h";
+  }
+  tft.setTextColor(TFT_LIGHTGREY);
+  tft.setTextSize(2);
+  int line2X = (320 - ((int)line2.length() * 12)) / 2;
+  if (line2X < 72) {
+    line2X = 72;
+  }
+  tft.setCursor(line2X, line2Y);
+  tft.print(line2);
+
+  int detailY = info.stormPossible ? 156 : 142;
+  tft.setTextSize(2);
+  if (info.stormPossible) {
+    uint8_t repeatMin = info.stormEtaHours;
+    if (repeatMin < 1) repeatMin = 1;
+    if (repeatMin > 6) repeatMin = 6;
+    String repeatLine = (tftLanguage == TFT_LANG_EN)
+                          ? ("Repeat: " + String(repeatMin) + " min")
+                          : ("Powtorz: " + String(repeatMin) + " min");
+    tft.setTextColor(TFT_CYAN);
+    tft.setCursor(74, detailY);
+    tft.print(repeatLine);
+    detailY += 24;
+  }
+
+  if (info.windPossible) {
+    String windLabel = (tftLanguage == TFT_LANG_EN) ? "Wind: " : "Wiatr: ";
+    String gustLabel = (tftLanguage == TFT_LANG_EN) ? "Gust: " : "MAX: ";
+    String windLine = windLabel + String(info.maxWindMs, 1) + " m/s";
+    tft.setTextColor(TFT_YELLOW);
+    tft.setCursor(74, detailY);
+    tft.print(windLine);
+    detailY += 22;
+
+    if (info.maxWindGustMs > 0.0f) {
+      String gustLine = gustLabel + String(info.maxWindGustMs, 1) + " m/s";
+      tft.setCursor(74, detailY);
+      tft.print(gustLine);
+      detailY += 22;
+    }
+  }
+
+  tft.setTextColor(TFT_LIGHTGREY);
+  tft.setTextSize(1);
+  String footer = (tftLanguage == TFT_LANG_EN)
+                    ? "Based on OpenWeather forecast"
+                    : "Na podstawie prognozy OpenWeather";
+  tft.setCursor(20, 220);
+  tft.print(footer);
 }
 
 void updateAlertScreenTimeout() {
@@ -9722,6 +13014,7 @@ bool fetchPotaApi() {
       return false;
     }
 
+    lockPotaSpots();
     potaSpotCount = 0;
     for (JsonObject spot : arr) {
       if (potaSpotCount >= MAX_POTA_SPOTS) break;
@@ -9760,7 +13053,9 @@ bool fetchPotaApi() {
         enqueueQrzLookup(s.callsign);
       }
     }
-    return potaSpotCount > 0;
+    bool hasPotaSpots = potaSpotCount > 0;
+    unlockPotaSpots();
+    return hasPotaSpots;
   };
 
   HTTPClient http;
@@ -9834,6 +13129,7 @@ bool fetchPotaApi() {
   }
 
   // Posortuj malejąco po czasie (ISO string porównuje się leksykograficznie poprawnie)
+  lockPotaSpots();
   for (int i = 0; i < potaSpotCount - 1; i++) {
     for (int j = i + 1; j < potaSpotCount; j++) {
       if (potaSpots[j].time > potaSpots[i].time) {
@@ -9843,8 +13139,10 @@ bool fetchPotaApi() {
       }
     }
   }
+  bool hasPotaSpots = potaSpotCount > 0;
+  unlockPotaSpots();
 
-  return potaSpotCount > 0;
+  return hasPotaSpots;
 }
 
 void removeQrzQueueAt(int idx) {
@@ -9902,14 +13200,7 @@ void updateSpotsWithQrz(const String &callsign, const String &grid,
 
     double userLatLocal = 0.0;
     double userLonLocal = 0.0;
-    bool userHasLatLon = userLatLonValid;
-    if (userHasLatLon) {
-      userLatLocal = userLat;
-      userLonLocal = userLon;
-    } else if (userLocator.length() >= 4) {
-      locatorToLatLon(userLocator, userLatLocal, userLonLocal);
-      userHasLatLon = true;
-    }
+    bool userHasLatLon = getServiceCoordinatesForServices(userLatLocal, userLonLocal);
 
     if (userHasLatLon && spotHasLatLon) {
       spots[i].distance = calculateDistance(userLatLocal, userLonLocal, spotLat, spotLon);
@@ -9918,6 +13209,7 @@ void updateSpotsWithQrz(const String &callsign, const String &grid,
   }
   unlockDxSpots();
 
+  lockPotaSpots();
   for (int i = 0; i < potaSpotCount; i++) {
     if (!potaSpots[i].callsign.equalsIgnoreCase(callsign)) {
       continue;
@@ -9950,20 +13242,14 @@ void updateSpotsWithQrz(const String &callsign, const String &grid,
 
     double userLatLocal = 0.0;
     double userLonLocal = 0.0;
-    bool userHasLatLon = userLatLonValid;
-    if (userHasLatLon) {
-      userLatLocal = userLat;
-      userLonLocal = userLon;
-    } else if (userLocator.length() >= 4) {
-      locatorToLatLon(userLocator, userLatLocal, userLonLocal);
-      userHasLatLon = true;
-    }
+    bool userHasLatLon = getServiceCoordinatesForServices(userLatLocal, userLonLocal);
 
     if (userHasLatLon && spotHasLatLon) {
       potaSpots[i].distance = calculateDistance(userLatLocal, userLonLocal, spotLat, spotLon);
       updatedPota = true;
     }
   }
+  unlockPotaSpots();
 
   if (updated) {
 #ifdef ENABLE_TFT_DISPLAY
@@ -10123,14 +13409,10 @@ bool parseDXSpot(String line, DXSpot &spot) {
   spot.hasLatLon = false;
   bool qrzConfigured = (qrzUsername.length() > 0 && qrzPassword.length() > 0);
   // Najpierw licz z lokatora jeĹ›li mamy lokalizacjÄ™ i lokator w spocie
-  if ((userLatLonValid || userLocator.length() >= 4) && spot.locator.length() >= 4) {
-    double userLatLocal, userLonLocal, spotLat, spotLon;
-    if (userLatLonValid) {
-      userLatLocal = userLat;
-      userLonLocal = userLon;
-    } else {
-      locatorToLatLon(userLocator, userLatLocal, userLonLocal);
-    }
+  double userLatLocal = 0.0;
+  double userLonLocal = 0.0;
+  if (getServiceCoordinatesForServices(userLatLocal, userLonLocal) && spot.locator.length() >= 4) {
+    double spotLat, spotLon;
     locatorToLatLon(spot.locator, spotLat, spotLon);
     spot.distance = calculateDistance(userLatLocal, userLonLocal, spotLat, spotLon);
     spot.lat = (float)spotLat;
@@ -10266,6 +13548,7 @@ void addSpot(DXSpot spot) {
 
 void addPotaSpot(DXSpot spot) {
   compactDxSpotStrings(spot);
+  lockPotaSpots();
   if (potaSpotCount < MAX_POTA_SPOTS) {
     potaSpotCount++;
   }
@@ -10275,10 +13558,12 @@ void addPotaSpot(DXSpot spot) {
   }
 
   potaSpots[0] = spot;
+  unlockPotaSpots();
 }
 
 void addHamalertSpot(DXSpot spot) {
   compactDxSpotStrings(spot);
+  lockHamalertSpots();
   if (hamalertSpotCount < MAX_POTA_SPOTS) {
     hamalertSpotCount++;
   }
@@ -10288,6 +13573,7 @@ void addHamalertSpot(DXSpot spot) {
   }
 
   hamalertSpots[0] = spot;
+  unlockHamalertSpots();
 }
 
 bool parseHamalertJsonSpot(const String &line, DXSpot &spot) {
@@ -10412,7 +13698,9 @@ bool fetchHamalertTelnet() {
   }
   Serial.println("[HAMALERT] connected");
 
+  lockHamalertSpots();
   hamalertSpotCount = 0;
+  unlockHamalertSpots();
   String line;
   line.reserve(HAMALERT_MAX_LINE_LEN + 16);
 
@@ -10538,20 +13826,20 @@ bool fetchHamalertTelnet() {
 
 // ========== APRS-IS FUNKCJE ==========
 
-// PoĹ‚Ä…cz z serwerem APRS-IS
+// Połącz z serwerem APRS-IS
 void connectToAPRS() {
   Serial.println("[APRS] connectToAPRS() START");
   
   if (!wifiConnected) {
-    Serial.println("[APRS] WiFi nie poĹ‚Ä…czony - wyjĹ›cie");
+    Serial.println("[APRS] WiFi nie połączony - wyjście");
     return;
   }
   
   if (aprsClient.connected()) {
-    // JeĹ›li konfiguracja siÄ™ zmieniĹ‚a, rozĹ‚Ä…cz i poĹ‚Ä…cz ponownie
-    Serial.println("[APRS] JuĹĽ poĹ‚Ä…czony - sprawdzam czy potrzeba reconnect...");
-    // MoĹĽna dodaÄ‡ sprawdzenie czy konfiguracja siÄ™ zmieniĹ‚a, ale na razie zostawiamy jak jest
-    // W razie potrzeby reconnect nastÄ…pi automatycznie przez watchdog
+    // Jeśli konfiguracja się zmieniła, rozłącz i połącz ponownie
+    Serial.println("[APRS] Już połączony - sprawdzam czy potrzeba reconnect...");
+    // Można dodać sprawdzenie czy konfiguracja się zmieniła, ale na razie zostawiamy jak jest
+    // W razie potrzeby reconnect nastąpi automatycznie przez watchdog
     return;
   }
   
@@ -10562,7 +13850,7 @@ void connectToAPRS() {
   
   lastAPRSAttempt = now;
   
-  Serial.print("[APRS] ĹÄ…czenie z APRS-IS: ");
+  Serial.print("[APRS] Łączenie z APRS-IS: ");
   Serial.print(aprsIsHost);
   Serial.print(":");
   Serial.println(aprsIsPort);
@@ -10579,15 +13867,15 @@ void connectToAPRS() {
     Serial.println(aprsIsHost);
   }
   
-  Serial.println("[APRS] WywoĹ‚anie aprsClient.connect()...");
+  Serial.println("[APRS] Wywołanie aprsClient.connect()...");
   unsigned long connectStart = millis();
   
-  // Ustaw timeout poĹ‚Ä…czenia (300 sekund jak w wymaganiach)
+  // Ustaw timeout połączenia (300 sekund jak w wymaganiach)
   aprsClient.setTimeout(300);
   
   if (aprsClient.connect(aprsIsHost.c_str(), aprsIsPort)) {
     unsigned long connectTime = millis() - connectStart;
-    Serial.print("[APRS] PoĹ‚Ä…czono z APRS-IS! (czas: ");
+    Serial.print("[APRS] Połączono z APRS-IS! (czas: ");
     Serial.print(connectTime);
     Serial.println("ms)");
     aprsConnected = true;
@@ -10595,12 +13883,12 @@ void connectToAPRS() {
     aprsLoginSent = false;
     lastAPRSRxMs = millis();
     
-    // Zaplanuj wysĹ‚anie loginu
-    delay(500); // KrĂłtkie opĂłĹşnienie przed loginem
+    // Zaplanuj wysłanie loginu
+    delay(500); // Krótkie opóźnienie przed loginem
     sendAPRSLogin();
   } else {
     unsigned long connectTime = millis() - connectStart;
-    Serial.print("[APRS] BĹ‚Ä…d poĹ‚Ä…czenia z APRS-IS (czas: ");
+    Serial.print("[APRS] Błąd połączenia z APRS-IS (czas: ");
     Serial.print(connectTime);
     Serial.println("ms)");
     aprsConnected = false;
@@ -10629,22 +13917,25 @@ void sendAPRSLogin() {
   aprsLoginSent = true;
   lastAPRSRxMs = millis();
   
-  // Po zalogowaniu wyĹ›lij filtr
+  // Po zalogowaniu wyślij filtr
   delay(500);
   sendAPRSFilter();
 }
 
-// WyĹ›lij komendÄ™ filtra do APRS-IS
+// Wyślij komendę filtra do APRS-IS
 void sendAPRSFilter() {
   if (!aprsConnected || !aprsClient.connected()) {
-    Serial.println("[APRS] Nie moĹĽna wysĹ‚aÄ‡ filtra - brak poĹ‚Ä…czenia");
+    Serial.println("[APRS] Nie można wysłać filtra - brak połączenia");
     return;
   }
   
   // Format filtra: #filter r/52.40/16.92/50
-  // UĹĽywamy wspĂłĹ‚rzÄ™dnych z sekcji "Moja Stacja"
-  double filterLat = userLatLonValid ? userLat : 52.40;  // Fallback jeĹ›li nie ustawione
-  double filterLon = userLatLonValid ? userLon : 16.92;
+  // Używamy współrzędnych z sekcji "Moja Stacja"
+  double filterLat = 52.40;  // Fallback jeśli nie ustawione
+  double filterLon = 16.92;
+  getServiceCoordinatesForServices(filterLat, filterLon);
+  unsigned long nowMs = millis();
+  bool gpsBased = useGpsIfActive && gpsLocationValid && isGpsFixActive(nowMs);
   String filter = "#filter r/";
   filter += String(filterLat, 2);
   filter += "/";
@@ -10652,11 +13943,43 @@ void sendAPRSFilter() {
   filter += "/";
   filter += String(aprsFilterRadius);
   
-  Serial.print("[APRS] WysyĹ‚anie filtra: ");
+  Serial.print("[APRS] Wysyłanie filtra: ");
   Serial.println(filter);
   
   aprsClient.println(filter);
   lastAPRSRxMs = millis();
+  aprsFilterLastSentMs = nowMs;
+  aprsFilterLastLat = filterLat;
+  aprsFilterLastLon = filterLon;
+  aprsFilterLastValid = true;
+  aprsFilterLastGpsBased = gpsBased;
+}
+
+static void refreshAprsFilterIfNeeded(unsigned long nowMs) {
+  if (!aprsConnected || !aprsClient.connected() || !aprsLoginSent) {
+    return;
+  }
+
+  if (aprsFilterLastSentMs != 0 && (nowMs - aprsFilterLastSentMs) < APRS_FILTER_REFRESH_MIN_INTERVAL_MS) {
+    return;
+  }
+
+  double currentLat = 0.0;
+  double currentLon = 0.0;
+  if (!getServiceCoordinatesForServices(currentLat, currentLon)) {
+    return;
+  }
+
+  bool gpsBasedNow = useGpsIfActive && gpsLocationValid && isGpsFixActive(nowMs);
+  if (!aprsFilterLastValid || gpsBasedNow != aprsFilterLastGpsBased) {
+    sendAPRSFilter();
+    return;
+  }
+
+  float movedKm = calculateDistance(aprsFilterLastLat, aprsFilterLastLon, currentLat, currentLon);
+  if (movedKm >= APRS_FILTER_REFRESH_MOVE_KM) {
+    sendAPRSFilter();
+  }
 }
 
 String formatAprsCoordinate(double value, bool isLat) {
@@ -10980,6 +14303,147 @@ static bool shouldTriggerAprsAlert(const APRSStation &station) {
   return true;
 }
 
+static uint8_t weatherStormRepeatMinutesFromEta(int etaMinutes) {
+  if (etaMinutes <= 0) {
+    return 1;
+  }
+  int hours = etaMinutes / 60;
+  if ((etaMinutes % 60) != 0) {
+    hours++;
+  }
+  if (hours < 1) {
+    hours = 1;
+  }
+  if (hours > 6) {
+    hours = 6;
+  }
+  return (uint8_t)hours;
+}
+
+static void queueWeatherAlertDraw(const WeatherAlertInfo &info) {
+  portENTER_CRITICAL(&weatherAlertPendingMux);
+  weatherAlertPendingInfo = info;
+  weatherAlertDrawPending = true;
+  portEXIT_CRITICAL(&weatherAlertPendingMux);
+}
+
+static void updateWeatherAlertForecastState(bool stormPossible,
+                                            int stormEtaMinutes,
+                                            bool windPossible,
+                                            float maxWindMs,
+                                            float maxWindGustMs) {
+  bool stormChanged = (weatherStormForecastActive != stormPossible);
+  bool windChanged = (weatherWindForecastActive != windPossible);
+
+  weatherStormForecastActive = stormPossible;
+  weatherWindForecastActive = windPossible;
+  weatherAlertForecastUpdatedMs = millis();
+
+  if (stormPossible) {
+    if (stormEtaMinutes < 1) {
+      stormEtaMinutes = 1;
+    }
+    if (stormEtaMinutes > 360) {
+      stormEtaMinutes = 360;
+    }
+    weatherStormEtaMinutes = stormEtaMinutes;
+    if (stormChanged) {
+      nextWeatherStormAlertMs = 0;
+    }
+  } else {
+    weatherStormEtaMinutes = 0;
+    nextWeatherStormAlertMs = 0;
+  }
+
+  weatherWindForecastMaxMs = maxWindMs;
+  weatherWindForecastGustMs = maxWindGustMs;
+  if (!windPossible) {
+    nextWeatherWindAlertMs = 0;
+  } else if (windChanged) {
+    nextWeatherWindAlertMs = 0;
+  }
+}
+
+static void processWeatherAlertSchedule() {
+  const bool stormTestMode = WEATHER_ALERT_STORM_TEST_MODE;
+  const bool windForceMode = WEATHER_ALERT_WIND_FORCE_ENABLED;
+
+  if (!(weatherAlertStormEnabled || stormTestMode) && !(weatherAlertWindEnabled || windForceMode)) {
+    return;
+  }
+  if (!tftInitialized || brightnessMenuActive || currentScreen == SCREEN_UNLIS_HUNTER || aprsAlertScreenActive) {
+    return;
+  }
+
+  unsigned long nowMs = millis();
+  WeatherAlertInfo info;
+  bool shouldNotify = false;
+
+  bool stormNowDetected = false;
+  if (weatherAlertStormEnabled && !stormTestMode) {
+    int currentWeatherId = 800;
+    bool currentWeatherValid = false;
+    unsigned long currentWeatherFetchedAtMs = 0;
+
+    lockWeatherData();
+    currentWeatherId = weatherData.weatherId;
+    currentWeatherValid = weatherData.valid;
+    currentWeatherFetchedAtMs = weatherData.fetchedAtMs;
+    unlockWeatherData();
+
+    if (currentWeatherValid && currentWeatherId >= 200 && currentWeatherId < 300) {
+      if (currentWeatherFetchedAtMs > 0 && (nowMs - currentWeatherFetchedAtMs) <= WEATHER_ALERT_CURRENT_DATA_MAX_AGE_MS) {
+        stormNowDetected = true;
+      }
+    }
+  }
+
+  if ((weatherAlertStormEnabled && (weatherStormForecastActive || stormNowDetected)) || stormTestMode) {
+    int elapsedMinutes = 0;
+    if (weatherAlertForecastUpdatedMs > 0 && nowMs > weatherAlertForecastUpdatedMs) {
+      elapsedMinutes = (int)((nowMs - weatherAlertForecastUpdatedMs) / 60000UL);
+    }
+    int etaMinutesNow = weatherStormEtaMinutes - elapsedMinutes;
+    if (etaMinutesNow < 1) {
+      etaMinutesNow = 1;
+    }
+
+    uint8_t repeatMinutes = (stormTestMode || stormNowDetected) ? 1 : weatherStormRepeatMinutesFromEta(etaMinutesNow);
+    if (nextWeatherStormAlertMs == 0 || (long)(nowMs - nextWeatherStormAlertMs) >= 0) {
+      info.stormPossible = true;
+      info.stormNow = stormNowDetected;
+      info.stormEtaHours = repeatMinutes;
+      shouldNotify = true;
+      nextWeatherStormAlertMs = nowMs + ((unsigned long)repeatMinutes * 60UL * 1000UL);
+    }
+  }
+
+  if ((weatherAlertWindEnabled || windForceMode) && (weatherWindForecastActive || windForceMode)) {
+    if (nextWeatherWindAlertMs == 0 || (long)(nowMs - nextWeatherWindAlertMs) >= 0) {
+      float currentWindMs = 0.0f;
+      lockWeatherData();
+      currentWindMs = weatherData.windMs;
+      unlockWeatherData();
+
+      info.windPossible = true;
+      info.maxWindMs = weatherWindForecastMaxMs;
+      info.maxWindGustMs = weatherWindForecastGustMs;
+      if (currentWindMs > info.maxWindMs) {
+        info.maxWindMs = currentWindMs;
+      }
+      if (windForceMode && info.maxWindMs <= 0.0f) {
+        info.maxWindMs = weatherAlertWindThresholdMs;
+      }
+      shouldNotify = true;
+      nextWeatherWindAlertMs = nowMs + WEATHER_ALERT_WIND_REPEAT_MS;
+    }
+  }
+
+  if (shouldNotify) {
+    queueWeatherAlertDraw(info);
+  }
+}
+
 static void applyAprsIntervalMinutes(int minutes) {
   int m = minutes;
   if (m < 1) m = 1;
@@ -11005,8 +14469,10 @@ void sendAprsPosition() {
   if (!aprsBeaconEnabled || !aprsConnected || !aprsClient.connected() || !aprsLoginSent) {
     return;
   }
-  if (!userLatLonValid) {
-    Serial.println("[APRS] Pomijam TX pozycji - brak poprawnych współrzędnych użytkownika");
+  double txLat = 0.0;
+  double txLon = 0.0;
+  if (!getServiceCoordinatesForServices(txLat, txLon)) {
+    Serial.println("[APRS] Pomijam TX pozycji - brak poprawnych współrzędnych stacji");
     return;
   }
 
@@ -11018,8 +14484,8 @@ void sendAprsPosition() {
   }
   txCallsign.toUpperCase();
 
-  String latStr = formatAprsCoordinate(userLat, true);
-  String lonStr = formatAprsCoordinate(userLon, false);
+  String latStr = formatAprsCoordinate(txLat, true);
+  String lonStr = formatAprsCoordinate(txLon, false);
 
   String frame = txCallsign;
   frame += ">APRS,TCPIP*:";
@@ -11040,6 +14506,214 @@ void sendAprsPosition() {
 
   Serial.print("[APRS] Wysłano pozycję: ");
   Serial.println(frame);
+}
+
+static bool parseAx25CallsignToken(const String &raw, String &baseOut, uint8_t &ssidOut) {
+  String token = raw;
+  token.trim();
+  token.toUpperCase();
+
+  if (token.endsWith("*")) {
+    token.remove(token.length() - 1);
+  }
+
+  int dashPos = token.indexOf('-');
+  String base = (dashPos >= 0) ? token.substring(0, dashPos) : token;
+  String ssidText = (dashPos >= 0) ? token.substring(dashPos + 1) : "";
+
+  String cleanedBase = "";
+  cleanedBase.reserve(base.length());
+  for (size_t i = 0; i < base.length(); i++) {
+    char c = base.charAt(i);
+    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+      cleanedBase += c;
+    }
+  }
+
+  if (cleanedBase.length() == 0) {
+    return false;
+  }
+  if (cleanedBase.length() > 6) {
+    cleanedBase = cleanedBase.substring(0, 6);
+  }
+
+  int ssid = 0;
+  if (ssidText.length() > 0) {
+    bool ssidValid = true;
+    for (size_t i = 0; i < ssidText.length(); i++) {
+      if (!isdigit((unsigned char)ssidText.charAt(i))) {
+        ssidValid = false;
+        break;
+      }
+    }
+    if (!ssidValid) {
+      return false;
+    }
+    ssid = ssidText.toInt();
+    if (ssid < 0 || ssid > 15) {
+      return false;
+    }
+  }
+
+  baseOut = cleanedBase;
+  ssidOut = (uint8_t)ssid;
+  return true;
+}
+
+static bool appendAx25AddressField(uint8_t *buffer, size_t bufferSize, size_t &offset, const String &callsignToken, bool isLastField, bool markRepeated) {
+  String baseCall = "";
+  uint8_t ssid = 0;
+  if (!parseAx25CallsignToken(callsignToken, baseCall, ssid)) {
+    return false;
+  }
+
+  if ((offset + 7) > bufferSize) {
+    return false;
+  }
+
+  for (int i = 0; i < 6; i++) {
+    char c = (i < (int)baseCall.length()) ? baseCall.charAt(i) : ' ';
+    buffer[offset + i] = (uint8_t)(((uint8_t)c) << 1);
+  }
+
+  uint8_t ssidByte = (uint8_t)(0x60 | ((ssid & 0x0F) << 1));
+  if (markRepeated) {
+    ssidByte |= 0x80;
+  }
+  if (isLastField) {
+    ssidByte |= 0x01;
+  }
+  buffer[offset + 6] = ssidByte;
+  offset += 7;
+  return true;
+}
+
+static void writeKissEscapedByte(uint8_t b) {
+  if (b == 0xC0) {
+    gpsSerial.write((uint8_t)0xDB);
+    gpsSerial.write((uint8_t)0xDC);
+    return;
+  }
+  if (b == 0xDB) {
+    gpsSerial.write((uint8_t)0xDB);
+    gpsSerial.write((uint8_t)0xDD);
+    return;
+  }
+  gpsSerial.write(b);
+}
+
+static bool sendAprsPositionToKiss() {
+  if (!aprsBeaconEnabled || !isUart2AprsTncKissModuleSelected()) {
+    return false;
+  }
+
+  double txLat = 0.0;
+  double txLon = 0.0;
+  if (!getServiceCoordinatesForServices(txLat, txLon)) {
+    Serial.println("[KISS] Pomijam TX pozycji - brak poprawnych współrzędnych stacji");
+    return false;
+  }
+
+  String txCallsign = getAprsTxCallsignWithSsid();
+  txCallsign.trim();
+  if (!isAprsTxCallValid(txCallsign)) {
+    Serial.println("[KISS] Pomijam TX pozycji - ustaw znak w konfiguracji APRS");
+    return false;
+  }
+  txCallsign.toUpperCase();
+
+  String latStr = formatAprsCoordinate(txLat, true);
+  String lonStr = formatAprsCoordinate(txLon, false);
+  bool useProjectComment = (((aprsBeaconTxCount + 1) % 5) == 0); // co piąty beacon
+  String comment = useProjectComment ? String(APRS_POSITION_COMMENT)
+                                     : sanitizeAprsComment(aprsUserComment);
+  String info = "!" + latStr + String(aprsSymbolTable) + lonStr + String(aprsSymbolCode) + " " + comment;
+
+  uint8_t ax25Payload[360];
+  size_t payloadLen = 0;
+
+  if (!appendAx25AddressField(ax25Payload, sizeof(ax25Payload), payloadLen, "APRS", false, false)) {
+    Serial.println("[KISS] Błąd budowy AX.25 (adres docelowy)");
+    return false;
+  }
+  if (!appendAx25AddressField(ax25Payload, sizeof(ax25Payload), payloadLen, txCallsign, false, false)) {
+    Serial.println("[KISS] Błąd budowy AX.25 (adres źródłowy)");
+    return false;
+  }
+  // RF New-N: domyslna sciezka dla mobilnej stacji APRS.
+  if (!appendAx25AddressField(ax25Payload, sizeof(ax25Payload), payloadLen, APRS_KISS_RF_PATH1, false, false)) {
+    Serial.println("[KISS] Błąd budowy AX.25 (ścieżka 1)");
+    return false;
+  }
+  if (!appendAx25AddressField(ax25Payload, sizeof(ax25Payload), payloadLen, APRS_KISS_RF_PATH2, true, false)) {
+    Serial.println("[KISS] Błąd budowy AX.25 (ścieżka 2)");
+    return false;
+  }
+
+  if ((payloadLen + 2) >= sizeof(ax25Payload)) {
+    Serial.println("[KISS] Błąd budowy AX.25 (za mały bufor nagłówka)");
+    return false;
+  }
+  ax25Payload[payloadLen++] = 0x03; // UI frame
+  ax25Payload[payloadLen++] = 0xF0; // no layer 3
+
+  for (size_t i = 0; i < info.length(); i++) {
+    if (payloadLen >= sizeof(ax25Payload)) {
+      Serial.println("[KISS] Błąd budowy AX.25 (za długi payload)");
+      return false;
+    }
+    ax25Payload[payloadLen++] = (uint8_t)info.charAt(i);
+  }
+
+  gpsSerial.write((uint8_t)0xC0);
+  gpsSerial.write((uint8_t)0x00); // KISS port 0, command Data
+  for (size_t i = 0; i < payloadLen; i++) {
+    writeKissEscapedByte(ax25Payload[i]);
+  }
+  gpsSerial.write((uint8_t)0xC0);
+
+  lastAPRSPositionTxMs = millis();
+  aprsBeaconTxCount++;
+
+  String pathInfo = String(APRS_KISS_RF_PATH1) + "," + String(APRS_KISS_RF_PATH2);
+  String positionInfo = "!" + latStr + String(aprsSymbolTable) + lonStr + String(aprsSymbolCode);
+  String tnc2Preview = txCallsign + ">APRS," + pathInfo + ":" + info;
+  Serial.print("[KISS] Wysłano beacon: ");
+  Serial.println(tnc2Preview);
+
+  APRS_BEACONING_Screen(txCallsign, positionInfo, pathInfo, tnc2Preview);
+  return true;
+}
+
+static void serviceAprsBeaconTx(unsigned long nowAprsMs) {
+  bool kissTxMode = isUart2AprsTncKissModuleSelected();
+  bool aprsTxCoordsReady = false;
+  double aprsTxLat = 0.0;
+  double aprsTxLon = 0.0;
+  aprsTxCoordsReady = getServiceCoordinatesForServices(aprsTxLat, aprsTxLon);
+
+  bool txChannelReady = false;
+  if (kissTxMode) {
+    txChannelReady = true;
+  } else {
+    txChannelReady = isAprsNetworkFeedEnabled() && aprsConnected && aprsClient.connected() && aprsLoginSent;
+  }
+
+  if (aprsBeaconEnabled && aprsTxCoordsReady && txChannelReady) {
+    if (nextAPRSPositionDueMs == 0) {
+      nextAPRSPositionDueMs = nowAprsMs + APRS_POSITION_FIRST_DELAY_MS;
+    } else if ((long)(nowAprsMs - nextAPRSPositionDueMs) >= 0) {
+      if (kissTxMode) {
+        sendAprsPositionToKiss();
+      } else {
+        sendAprsPosition();
+      }
+      nextAPRSPositionDueMs = nowAprsMs + aprsPositionIntervalMs;
+    }
+  } else {
+    nextAPRSPositionDueMs = 0; // reset harmonogramu gdy beacon wyłączony lub brak warunków TX
+    aprsBeaconTxCount = 0;
+  }
 }
 
 // Parsuj ramkÄ™ APRS
@@ -11378,8 +15052,9 @@ bool parseAPRSFrame(String line, APRSStation &station) {
   // UĹĽywamy wspĂłĹ‚rzÄ™dnych z sekcji "Moja Stacja"
   if (station.hasLatLon) {
     // UĹĽyj double dla wiÄ™kszej precyzji obliczeĹ„
-    double userLatForDistance = userLatLonValid ? userLat : 52.40;  // Fallback jeĹ›li nie ustawione
-    double userLonForDistance = userLatLonValid ? userLon : 16.92;
+    double userLatForDistance = 52.40;  // Fallback jeśli nie ustawione
+    double userLonForDistance = 16.92;
+    getServiceCoordinatesForServices(userLatForDistance, userLonForDistance);
     double stationLat = (double)station.lat;
     double stationLon = (double)station.lon;
     
@@ -11445,6 +15120,34 @@ void addAPRSStation(APRSStation station) {
   LOGV_PRINTLN(aprsStationCount);
 }
 
+static void processAprsFrameFromLine(const String &line, const char *sourceTag) {
+  APRSStation station;
+  if (!parseAPRSFrame(line, station)) {
+    return;
+  }
+
+  addAPRSStation(station);
+
+  // While Unlis Hunter or TFT settings screen is active,
+  // suppress APRS alert popups and LED/buzzer alerts.
+  if (aprsAlertEnabled && currentScreen != SCREEN_UNLIS_HUNTER && !brightnessMenuActive && shouldTriggerAprsAlert(station)) {
+    Serial.print("[APRS ALERT] stacja wykryta (");
+    Serial.print(sourceTag);
+    Serial.print("): ");
+    Serial.println(line);
+    bool isWxStation = aprsAlertWxEnabled && isAprsWxPayloadValidForAlert(station);
+    if (!isWxStation) {
+      triggerAprsRgbLedAlert();
+    }
+    #ifdef ENABLE_TFT_DISPLAY
+    portENTER_CRITICAL(&aprsAlertPendingMux);
+    aprsAlertPendingStation = station;
+    aprsAlertDrawPending = true;
+    portEXIT_CRITICAL(&aprsAlertPendingMux);
+    #endif
+  }
+}
+
 // ObsĹ‚uga danych z APRS-IS
 void handleAPRSData() {
   if (!aprsConnected || !aprsClient.connected()) {
@@ -11473,23 +15176,7 @@ void handleAPRSData() {
           continue;
         }
         
-        // Parsuj ramkÄ™ APRS
-        APRSStation station;
-        if (parseAPRSFrame(line, station)) {
-          addAPRSStation(station);
-
-          if (aprsAlertEnabled && shouldTriggerAprsAlert(station)) {
-            Serial.print("[APRS ALERT] stacja wykryta opisana w formacie tnc: ");
-            Serial.println(line);
-            triggerAprsRgbLedAlert();
-            #ifdef ENABLE_TFT_DISPLAY
-            portENTER_CRITICAL(&aprsAlertPendingMux);
-            aprsAlertPendingStation = station;
-            aprsAlertDrawPending = true;
-            portEXIT_CRITICAL(&aprsAlertPendingMux);
-            #endif
-          }
-        }
+        processAprsFrameFromLine(line, "APRS-IS");
       }
     } else if (c != 0) {
       // Keep control bytes (e.g. 0x1C/0x1D) for Mic-E decode compatibility.
@@ -11509,6 +15196,8 @@ void startAPMode() {
   // ĹĽeby nie gubiÄ‡ poĹ‚Ä…czenia na telefonie/PC przy zmianie kanaĹ‚u przez STA.
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
+  // Odmierzaj ponowną próbę STA od momentu wejścia do AP.
+  lastWiFiReconnectAttempt = millis();
   Serial.println("AP Mode uruchomiony");
   Serial.print("SSID: ");
   Serial.println(AP_SSID);
@@ -11527,6 +15216,10 @@ void requestRestart(unsigned long delayMs = 1500) {
 }
 
 bool connectToWiFi() {
+  return connectToWiFiWithAttempts(40, true);
+}
+
+bool connectToWiFiWithAttempts(uint8_t maxAttemptsPerSsid, bool runDiagnostics) {
   if (wifiSSID.length() == 0 && wifiSSID2.length() == 0) {
     return false;
   }
@@ -11538,7 +15231,7 @@ bool connectToWiFi() {
 
   WiFiCred candidates[2] = {{wifiSSID, wifiPassword}, {wifiSSID2, wifiPassword2}};
 
-  auto attemptConnect = [](const WiFiCred &cred) -> bool {
+  auto attemptConnect = [maxAttemptsPerSsid, runDiagnostics](const WiFiCred &cred) -> bool {
     Serial.println("=== WiFi connect ===");
     Serial.print("SSID: '");
     Serial.print(cred.ssid);
@@ -11560,7 +15253,7 @@ bool connectToWiFi() {
     WiFi.begin(cred.ssid.c_str(), cred.pass.c_str());
 
     int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    while (WiFi.status() != WL_CONNECTED && attempts < maxAttemptsPerSsid) {
       delay(500);
       yield();
       Serial.print(".");
@@ -11577,29 +15270,31 @@ bool connectToWiFi() {
     Serial.print("WiFi.status(): ");
     Serial.println((int)WiFi.status());
 
-    Serial.println("--- WiFi diag ---");
-    WiFi.printDiag(Serial);
-    Serial.println("--- Scan networks ---");
-    int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
-    Serial.print("Znaleziono sieci: ");
-    Serial.println(n);
-    bool found = false;
-    for (int i = 0; i < n; i++) {
-      String s = WiFi.SSID(i);
-      int32_t rssi = WiFi.RSSI(i);
-      wifi_auth_mode_t enc = WiFi.encryptionType(i);
-      if (s == cred.ssid) {
-        found = true;
-        Serial.print("MATCH SSID: ");
-        Serial.print(s);
-        Serial.print(" RSSI=");
-        Serial.print(rssi);
-        Serial.print(" enc=");
-        Serial.println((int)enc);
+    if (runDiagnostics) {
+      Serial.println("--- WiFi diag ---");
+      WiFi.printDiag(Serial);
+      Serial.println("--- Scan networks ---");
+      int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
+      Serial.print("Znaleziono sieci: ");
+      Serial.println(n);
+      bool found = false;
+      for (int i = 0; i < n; i++) {
+        String s = WiFi.SSID(i);
+        int32_t rssi = WiFi.RSSI(i);
+        wifi_auth_mode_t enc = WiFi.encryptionType(i);
+        if (s == cred.ssid) {
+          found = true;
+          Serial.print("MATCH SSID: ");
+          Serial.print(s);
+          Serial.print(" RSSI=");
+          Serial.print(rssi);
+          Serial.print(" enc=");
+          Serial.println((int)enc);
+        }
       }
-    }
-    if (!found) {
-      Serial.println("UWAGA: Nie widzÄ™ Twojego SSID w skanie (moĹĽe 5GHz / inny SSID / poza zasiÄ™giem / ukryte SSID).");
+      if (!found) {
+        Serial.println("UWAGA: Nie widzÄ™ Twojego SSID w skanie (moĹĽe 5GHz / inny SSID / poza zasiÄ™giem / ukryte SSID).");
+      }
     }
 
     return false;
@@ -11638,18 +15333,87 @@ bool connectToWiFi() {
   return false;
 }
 
+void retryWiFiFromAPIfDue(unsigned long now) {
+  if (wifiConnected) {
+    return;
+  }
+
+  if (wifiSSID.length() == 0 && wifiSSID2.length() == 0) {
+    return;
+  }
+
+  // Retry uruchamiaj tylko wtedy, gdy urządzenie realnie działa jako AP.
+  if ((WiFi.getMode() & WIFI_AP) == 0) {
+    return;
+  }
+
+  if (lastWiFiReconnectAttempt != 0 && (now - lastWiFiReconnectAttempt) < WIFI_AP_RETRY_INTERVAL_MS) {
+    return;
+  }
+
+  lastWiFiReconnectAttempt = now;
+  Serial.println("[WIFI] AP retry timer elapsed -> trying STA (SSID1/SSID2)");
+
+  if (connectToWiFi()) {
+    Serial.println("[WIFI] STA reconnect successful");
+    return;
+  }
+
+  Serial.println("[WIFI] STA reconnect failed, returning to AP mode");
+  startAPMode();
+}
+
+void retryWiFiFromSTAIfDue(unsigned long now) {
+  if (wifiConnected) {
+    wifiStaRetryWindowStartMs = 0;
+    return;
+  }
+
+  if (wifiSSID.length() == 0 && wifiSSID2.length() == 0) {
+    return;
+  }
+
+  // W AP retry obsługuje osobna funkcja.
+  if (WiFi.getMode() & WIFI_AP) {
+    return;
+  }
+
+  if (wifiStaRetryWindowStartMs == 0) {
+    wifiStaRetryWindowStartMs = now;
+  }
+
+  if ((now - wifiStaRetryWindowStartMs) >= WIFI_STA_RETRY_WINDOW_MS) {
+    Serial.println("[WIFI] STA retry window (10 min) elapsed -> switching to AP mode");
+    wifiStaRetryWindowStartMs = 0;
+    startAPMode();
+    return;
+  }
+
+  if (lastWiFiStaReconnectAttempt != 0 && (now - lastWiFiStaReconnectAttempt) < WIFI_STA_RETRY_INTERVAL_MS) {
+    return;
+  }
+
+  lastWiFiStaReconnectAttempt = now;
+  Serial.println("[WIFI] STA offline -> retry connect (SSID1/SSID2)");
+  if (connectToWiFiWithAttempts(WIFI_STA_RECONNECT_ATTEMPTS, false)) {
+    Serial.println("[WIFI] STA reconnect successful");
+    wifiStaRetryWindowStartMs = 0;
+    updateNTPTime();
+  }
+}
+
 // ========== TELNET CLUSTER ==========
 
 void connectToCluster() {
   Serial.println("[CLUSTER] connectToCluster() START");
   
   if (!wifiConnected) {
-    Serial.println("[CLUSTER] WiFi nie poĹ‚Ä…czony - wyjĹ›cie");
+    Serial.println("[CLUSTER] WiFi nie połączony - wyjście");
     return;
   }
   
   if (telnetClient.connected()) {
-    Serial.println("[CLUSTER] JuĹĽ poĹ‚Ä…czony - wyjĹ›cie");
+    Serial.println("[CLUSTER] Już połączony - wyjście");
     return;
   }
   
@@ -11660,7 +15424,7 @@ void connectToCluster() {
   
   lastTelnetAttempt = now;
   
-  Serial.print("[CLUSTER] ĹÄ…czenie z DX Cluster: ");
+  Serial.print("[CLUSTER] Łączenie z DX Cluster: ");
   Serial.print(clusterHost);
   Serial.print(":");
   Serial.println(clusterPort);
@@ -11677,11 +15441,11 @@ void connectToCluster() {
     Serial.println(clusterHost);
   }
   
-  Serial.println("[CLUSTER] WywoĹ‚anie telnetClient.connect()...");
+  Serial.println("[CLUSTER] Wywołanie telnetClient.connect()...");
   unsigned long connectStart = millis();
   if (telnetClient.connect(clusterHost.c_str(), clusterPort)) {
     unsigned long connectTime = millis() - connectStart;
-    Serial.print("[CLUSTER] PoĹ‚Ä…czono z DX Cluster! (czas: ");
+    Serial.print("[CLUSTER] Połączono z DX Cluster! (czas: ");
     Serial.print(connectTime);
     Serial.println("ms)");
     telnetConnected = true;
@@ -11697,7 +15461,7 @@ void connectToCluster() {
     clusterSendLoginAtMs = millis() + 1000;
   } else {
     unsigned long connectTime = millis() - connectStart;
-    Serial.print("[CLUSTER] BĹ‚Ä…d poĹ‚Ä…czenia z DX Cluster (czas: ");
+    Serial.print("[CLUSTER] Błąd połączenia z DX Cluster (czas: ");
     Serial.print(connectTime);
     Serial.println("ms)");
     telnetConnected = false;
@@ -11722,7 +15486,7 @@ void connectToPotaCluster() {
   }
   lastPotaAttempt = now;
 
-  Serial.print("[POTA] ĹÄ…czenie z POTA Cluster: ");
+  Serial.print("[POTA] Łączenie z POTA Cluster: ");
   Serial.print(potaClusterHost);
   Serial.print(":");
   Serial.println(potaClusterPort);
@@ -11739,7 +15503,7 @@ void connectToPotaCluster() {
   }
 
   if (potaTelnetClient.connect(potaClusterHost.c_str(), potaClusterPort)) {
-    Serial.println("[POTA] PoĹ‚Ä…czono z POTA Cluster!");
+    Serial.println("[POTA] Połączono z POTA Cluster!");
     potaTelnetConnected = true;
     potaTelnetBuffer = "";
     pendingPotaLine = "";
@@ -11767,7 +15531,7 @@ void connectToPotaCluster() {
       potaTelnetClient.print("\r\n");
     }
   } else {
-    Serial.println("[POTA] BĹ‚Ä…d poĹ‚Ä…czenia z POTA Cluster");
+    Serial.println("[POTA] Błąd połączenia z POTA Cluster");
     potaTelnetConnected = false;
   }
 }
@@ -11777,13 +15541,13 @@ void connectToPotaCluster() {
 // NIE wysyĹ‚a ĹĽadnych spotĂłw - urzÄ…dzenie dziaĹ‚a tylko w trybie odbioru
 void sendClusterCommand(String command) {
   if (!telnetConnected || !telnetClient.connected()) {
-    Serial.print("[CLUSTER] Nie moĹĽna wysĹ‚aÄ‡ komendy '");
+    Serial.print("[CLUSTER] Nie mo\u017Cna wys\u0142a\u0107 komendy '");
     Serial.print(command);
-    Serial.println("' - brak poĹ‚Ä…czenia");
+    Serial.println("' - brak połączenia");
     return;
   }
   
-  Serial.print("[CLUSTER] WysyĹ‚anie komendy: ");
+  Serial.print("[CLUSTER] Wysy\u0142anie komendy: ");
   Serial.println(command);
   telnetClient.print(command);
   telnetClient.print("\r\n");
@@ -11796,7 +15560,7 @@ void sendClusterConfigCommands() {
     return;
   }
   
-  Serial.println("[CLUSTER] WysyĹ‚anie komend konfiguracyjnych CC-Cluster...");
+  Serial.println("[CLUSTER] Wysy\u0142anie komend konfiguracyjnych CC-Cluster...");
   
   // WyĹ‚Ä…cz ogĹ‚oszenia (domyĹ›lnie wĹ‚Ä…czone)
   if (clusterNoAnnouncements) {
@@ -11835,7 +15599,7 @@ void sendClusterConfigCommands() {
     sendClusterCommand("set/nofilter");
   }
   
-  Serial.println("[CLUSTER] Komendy konfiguracyjne wysĹ‚ane");
+  Serial.println("[CLUSTER] Komendy konfiguracyjne wys\u0142ane");
 }
 
 void handleTelnetData() {
@@ -11928,7 +15692,7 @@ void handleTelnetData() {
 void handlePotaTelnetData() {
   if (!potaTelnetConnected || !potaTelnetClient.connected()) {
     if (potaTelnetConnected) {
-      LOGV_PRINTLN("[POTA] PoĹ‚Ä…czenie zerwane - reset flag");
+      LOGV_PRINTLN("[POTA] Połączenie zerwane - reset flag");
     }
     potaTelnetConnected = false;
     potaLoginSent = false;
@@ -11967,7 +15731,7 @@ void handlePotaTelnetData() {
   }
 
   if (!potaTelnetClient.connected()) {
-    LOGV_PRINTLN("[POTA] RozĹ‚Ä…czono z POTA Cluster");
+    LOGV_PRINTLN("[POTA] Rozłączono z POTA Cluster");
     potaTelnetConnected = false;
     potaLoginSent = false;
     potaLoginScheduled = false;
@@ -11978,6 +15742,10 @@ void handlePotaTelnetData() {
 
 void updateNTPTime() {
   unsigned long now = millis();
+  if (isGpsTimeSourceActive(now)) {
+    return;
+  }
+
   if (lastNTPUpdate != 0 && (now - lastNTPUpdate < 3600000)) { // Aktualizuj co godzinÄ™
     return;
   }
@@ -12055,15 +15823,27 @@ void loadPreferences() {
   yield();
   userLocator = preferences->getString("user_locator", "");
   yield();
-  timezoneHours = preferences->getInt("timezone", DEFAULT_TIMEZONE_HOURS);
-  if (timezoneHours < -12) timezoneHours = -12;
-  if (timezoneHours > 14) timezoneHours = 14;
+  timezoneHours = preferences->getFloat("timezone", DEFAULT_TIMEZONE_HOURS);
+  if (timezoneHours < -12.0f) timezoneHours = -12.0f;
+  if (timezoneHours > 14.0f) timezoneHours = 14.0f;
   yield();
   userLat = preferences->getFloat("user_lat", 0.0f);
   yield();
   userLon = preferences->getFloat("user_lon", 0.0f);
   yield();
   userLatLonValid = preferences->getBool("user_ll_ok", false);
+  useGpsIfActive = preferences->getBool(NVS_KEY_USE_GPS_IF_ACTIVE, false);
+  uart2ConnectedModule = sanitizeUart2ConnectedModule(
+    preferences->getString(NVS_KEY_UART2_CONNECTED_MODULE, "none")
+  );
+  uart2Mode = uart2ModeFromCode(preferences->getString(NVS_KEY_UART2_MODE, "gps"));
+  applyUart2BaudRate(preferences->getInt(NVS_KEY_UART2_BAUD, (int)DEFAULT_UART2_BAUD));
+  applyUart2DataBits(preferences->getInt(NVS_KEY_UART2_DATABITS, DEFAULT_UART2_DATA_BITS));
+  uart2Parity = uart2ParityFromCode(preferences->getString(NVS_KEY_UART2_PARITY, "none"));
+  applyUart2StopBits(preferences->getInt(NVS_KEY_UART2_STOP_BITS, DEFAULT_UART2_STOP_BITS));
+  bridgeBtPairedAddress = normalizeBridgeBtAddress(preferences->getString(NVS_KEY_BRIDGE_PAIR_ADDR, ""));
+  bridgeBtPairedName = sanitizeBridgeTextField(preferences->getString(NVS_KEY_BRIDGE_PAIR_NAME, ""), 40);
+  bridgeBtAutoConnectPending = (bridgeBtPairedAddress.length() == 12);
   yield();
   qrzUsername = preferences->getString("qrz_user", "");
   yield();
@@ -12076,9 +15856,14 @@ void loadPreferences() {
   backlightPercent = preferences->getInt("tft_backlight", TFT_BACKLIGHT);
   if (backlightPercent < MIN_BACKLIGHT_PERCENT) backlightPercent = MIN_BACKLIGHT_PERCENT;
   if (backlightPercent > 100) backlightPercent = 100;
+  tftNightDimmingPercent = preferences->getInt(NVS_KEY_TFT_NIGHT_DIMMING, 0);
+  if (tftNightDimmingPercent < 0) tftNightDimmingPercent = 0;
+  if (tftNightDimmingPercent > 100) tftNightDimmingPercent = 100;
   tftInvertColors = preferences->getBool("tft_inv", tftInvertColors);
   tftLanguage = preferences->getUChar("tft_lang", TFT_LANG_PL);
   if (tftLanguage > TFT_LANG_EN) tftLanguage = TFT_LANG_PL;
+  tftStyleMode = preferences->getUChar("tft_style", TFT_STYLE_DARK);
+  if (tftStyleMode > TFT_STYLE_LIGHT) tftStyleMode = TFT_STYLE_DARK;
   dxTableSizeMode = preferences->getUChar("tft_tbl_size", DX_TABLE_SIZE_NORMAL);
   if (dxTableSizeMode > DX_TABLE_SIZE_ENLARGED) dxTableSizeMode = DX_TABLE_SIZE_NORMAL;
   int savedMenuHue = preferences->getInt("menu_hue", DEFAULT_MENU_THEME_HUE);
@@ -12107,6 +15892,39 @@ void loadPreferences() {
   }
   screen1TimeMode = (uint8_t)preferences->getInt("screen1_time", SCREEN1_TIME_UTC);
   if (screen1TimeMode > SCREEN1_TIME_LOCAL) screen1TimeMode = SCREEN1_TIME_UTC;
+
+  screen2FilterModeMask = preferences->getUChar("s2_mode", 0);
+  screen2FilterModeMask &= (FILTER_MODE_BIT_CW | FILTER_MODE_BIT_SSB | FILTER_MODE_BIT_DIGI);
+  uint16_t screen2BandAllowedMask = 0;
+  for (int bandIdx = 1; bandIdx < SCREEN8_FILTER_BANDS_COUNT; bandIdx++) {
+    screen2BandAllowedMask |= getBandFilterBitForIndex(bandIdx);
+  }
+  screen2FilterBandMask = (uint16_t)preferences->getUInt("s2_band", 0);
+  screen2FilterBandMask &= screen2BandAllowedMask;
+
+  uint8_t loadedScreen6Sort = preferences->getUChar("s6_sort", APRS_SORT_TIME);
+  if (loadedScreen6Sort > APRS_SORT_DISTANCE) {
+    loadedScreen6Sort = APRS_SORT_TIME;
+  }
+  screen6SortMode = (Screen6SortMode)loadedScreen6Sort;
+
+  screen7FilterModeMask = preferences->getUChar("s7_mode", 0);
+  screen7FilterModeMask &= (FILTER_MODE_BIT_CW | FILTER_MODE_BIT_SSB | FILTER_MODE_BIT_DIGI);
+  uint16_t screen7BandAllowedMask = 0;
+  for (int bandIdx = 1; bandIdx < SCREEN2_FILTER_BANDS_COUNT; bandIdx++) {
+    screen7BandAllowedMask |= getBandFilterBitForIndex(bandIdx);
+  }
+  screen7FilterBandMask = (uint16_t)preferences->getUInt("s7_band", 0);
+  screen7FilterBandMask &= screen7BandAllowedMask;
+
+  screen8FilterModeMask = preferences->getUChar("s8_mode", 0);
+  screen8FilterModeMask &= (FILTER_MODE_BIT_CW | FILTER_MODE_BIT_SSB | FILTER_MODE_BIT_DIGI);
+  uint16_t screen8BandAllowedMask = 0;
+  for (int bandIdx = 1; bandIdx < SCREEN8_FILTER_BANDS_COUNT; bandIdx++) {
+    screen8BandAllowedMask |= getBandFilterBitForIndex(bandIdx);
+  }
+  screen8FilterBandMask = (uint16_t)preferences->getUInt("s8_band", 0);
+  screen8FilterBandMask &= screen8BandAllowedMask;
   
   // Konfiguracja filtrĂłw CC-Cluster
   clusterNoAnnouncements = preferences->getBool("cluster_noann", true);
@@ -12115,9 +15933,9 @@ void loadPreferences() {
   yield();
   clusterNoWCY = preferences->getBool("cluster_nowcy", true);
   yield();
-  clusterUseFilters = preferences->getBool("cluster_usefilters", false);
+  clusterUseFilters = preferences->getBool(NVS_KEY_CLUSTER_USEFILTERS, true);
   yield();
-  clusterFilterCommands = preferences->getString("cluster_filters", "");
+  clusterFilterCommands = preferences->getString("cluster_filters", "set/ft8");
   yield();
   
   // Konfiguracja APRS-IS
@@ -12143,6 +15961,9 @@ void loadPreferences() {
   aprsAlertNearbyEnabled = preferences->getBool("aprs_alert_near_en", true);
   aprsAlertWxEnabled = preferences->getBool(NVS_KEY_APRS_ALERT_WX_ENABLED, false);
   applyAprsAlertDistanceKm(preferences->getFloat(NVS_KEY_APRS_ALERT_DISTANCE_KM, DEFAULT_APRS_ALERT_DISTANCE_KM));
+  weatherAlertStormEnabled = preferences->getBool(NVS_KEY_WEATHER_ALERT_STORM_ENABLED, DEFAULT_WEATHER_ALERT_STORM_ENABLED);
+  weatherAlertWindEnabled = preferences->getBool(NVS_KEY_WEATHER_ALERT_WIND_ENABLED, DEFAULT_WEATHER_ALERT_WIND_ENABLED);
+  applyWeatherAlertWindThresholdMs(preferences->getFloat(NVS_KEY_WEATHER_ALERT_WIND_THRESHOLD_MS, DEFAULT_WEATHER_ALERT_WIND_THRESHOLD_MS));
   enableLedAlert = preferences->getBool(NVS_KEY_ENABLE_LED_ALERT, DEFAULT_ENABLE_LED_ALERT);
   applyLedAlertDurationMs(preferences->getInt(NVS_KEY_LED_ALERT_DURATION_MS, DEFAULT_LED_ALERT_DURATION_MS));
   applyLedAlertBlinkMs(preferences->getInt(NVS_KEY_LED_ALERT_BLINK_MS, DEFAULT_LED_ALERT_BLINK_MS));
@@ -12196,20 +16017,38 @@ void savePreferences() {
   preferences->putString("hama_pass", hamalertPassword);
   preferences->putString("user_callsign", userCallsign);
   preferences->putString("user_locator", userLocator);
-  preferences->putInt("timezone", timezoneHours);
+  preferences->putFloat("timezone", timezoneHours);
   preferences->putFloat("user_lat", (float)userLat);
   preferences->putFloat("user_lon", (float)userLon);
   preferences->putBool("user_ll_ok", userLatLonValid);
+  preferences->putBool(NVS_KEY_USE_GPS_IF_ACTIVE, useGpsIfActive);
+  preferences->putString(NVS_KEY_UART2_CONNECTED_MODULE, uart2ConnectedModule);
+  preferences->putString(NVS_KEY_UART2_MODE, uart2ModeToCode(uart2Mode));
+  preferences->putInt(NVS_KEY_UART2_BAUD, (int)uart2BaudRate);
+  preferences->putInt(NVS_KEY_UART2_DATABITS, (int)uart2DataBits);
+  preferences->putString(NVS_KEY_UART2_PARITY, uart2ParityToCode(uart2Parity));
+  preferences->putInt(NVS_KEY_UART2_STOP_BITS, (int)uart2StopBits);
+  preferences->putString(NVS_KEY_BRIDGE_PAIR_ADDR, bridgeBtPairedAddress);
+  preferences->putString(NVS_KEY_BRIDGE_PAIR_NAME, bridgeBtPairedName);
   preferences->putString("qrz_user", qrzUsername);
   preferences->putString("qrz_pass", qrzPassword);
   preferences->putString("weather_key", weatherApiKey);
   preferences->putString("openwebrx_url", openWebRxUrl);
   preferences->putInt("tft_backlight", backlightPercent);
+  preferences->putInt(NVS_KEY_TFT_NIGHT_DIMMING, tftNightDimmingPercent);
   preferences->putBool("tft_inv", tftInvertColors);
   preferences->putUChar("tft_lang", tftLanguage);
+  preferences->putUChar("tft_style", tftStyleMode);
   preferences->putUChar("tft_tbl_size", dxTableSizeMode);
   preferences->putInt("menu_hue", menuThemeHue);
   preferences->putInt("screen1_time", screen1TimeMode);
+  preferences->putUChar("s2_mode", screen2FilterModeMask);
+  preferences->putUInt("s2_band", (uint32_t)screen2FilterBandMask);
+  preferences->putUChar("s6_sort", (uint8_t)screen6SortMode);
+  preferences->putUChar("s7_mode", screen7FilterModeMask);
+  preferences->putUInt("s7_band", (uint32_t)screen7FilterBandMask);
+  preferences->putUChar("s8_mode", screen8FilterModeMask);
+  preferences->putUInt("s8_band", (uint32_t)screen8FilterBandMask);
   preferences->putBool("tft_autosw", tftAutoSwitchEnabled);
   preferences->putInt("tft_sw_sec", tftAutoSwitchTimeSec);
   preferences->putInt("touch_xmin", touchXMin);
@@ -12238,6 +16077,9 @@ void savePreferences() {
   preferences->putBool("aprs_alert_near_en", aprsAlertNearbyEnabled);
   preferences->putBool(NVS_KEY_APRS_ALERT_WX_ENABLED, aprsAlertWxEnabled);
   preferences->putFloat(NVS_KEY_APRS_ALERT_DISTANCE_KM, aprsAlertDistanceKm);
+  preferences->putBool(NVS_KEY_WEATHER_ALERT_STORM_ENABLED, weatherAlertStormEnabled);
+  preferences->putBool(NVS_KEY_WEATHER_ALERT_WIND_ENABLED, weatherAlertWindEnabled);
+  preferences->putFloat(NVS_KEY_WEATHER_ALERT_WIND_THRESHOLD_MS, weatherAlertWindThresholdMs);
   preferences->putBool(NVS_KEY_ENABLE_LED_ALERT, enableLedAlert);
   preferences->putInt(NVS_KEY_LED_ALERT_DURATION_MS, ledAlertDurationMs);
   preferences->putInt(NVS_KEY_LED_ALERT_BLINK_MS, ledAlertBlinkMs);
@@ -12253,7 +16095,7 @@ void savePreferences() {
   preferences->putBool("cluster_noann", clusterNoAnnouncements);
   preferences->putBool("cluster_nowwv", clusterNoWWV);
   preferences->putBool("cluster_nowcy", clusterNoWCY);
-  preferences->putBool("cluster_usefilters", clusterUseFilters);
+  preferences->putBool(NVS_KEY_CLUSTER_USEFILTERS, clusterUseFilters);
   preferences->putString("cluster_filters", clusterFilterCommands);
   
   preferences->end();
@@ -12266,6 +16108,19 @@ void savePreferences() {
 String getMainHTML();
 String getConfigHTML();
 
+static bool streamLittleFsFile(const char *path, const char *contentType) {
+  if (!littleFsReady) {
+    return false;
+  }
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    return false;
+  }
+  server->streamFile(f, contentType);
+  f.close();
+  return true;
+}
+
 void setupWebServer() {
   // UtwĂłrz serwer jeĹ›li jeszcze nie istnieje
   if (server == nullptr) {
@@ -12274,70 +16129,68 @@ void setupWebServer() {
   
   // Strona gĹ‚Ăłwna
   server->on("/", HTTP_GET, []() {
-    if (littleFsReady && LittleFS.exists("/index.html")) {
-      File f = LittleFS.open("/index.html", "r");
-      server->streamFile(f, "text/html; charset=utf-8");
-      f.close();
-    } else {
+    if (!streamLittleFsFile("/index.html", "text/html; charset=utf-8")) {
       server->send(200, "text/html; charset=utf-8", getMainHTML());
     }
   });
 
   // Strona gĹ‚Ăłwna (alias /index.html)
   server->on("/index.html", HTTP_GET, []() {
-    if (littleFsReady && LittleFS.exists("/index.html")) {
-      File f = LittleFS.open("/index.html", "r");
-      server->streamFile(f, "text/html; charset=utf-8");
-      f.close();
-    } else {
+    if (!streamLittleFsFile("/index.html", "text/html; charset=utf-8")) {
       server->send(200, "text/html; charset=utf-8", getMainHTML());
     }
   });
 
   // Strona gĹ‚Ăłwna (EN)
   server->on("/indexEN.html", HTTP_GET, []() {
-    if (littleFsReady && LittleFS.exists("/indexEN.html")) {
-      File f = LittleFS.open("/indexEN.html", "r");
-      server->streamFile(f, "text/html; charset=utf-8");
-      f.close();
-    } else if (littleFsReady && LittleFS.exists("/index.html")) {
-      File f = LittleFS.open("/index.html", "r");
-      server->streamFile(f, "text/html; charset=utf-8");
-      f.close();
-    } else {
+    if (!streamLittleFsFile("/indexEN.html", "text/html; charset=utf-8") &&
+        !streamLittleFsFile("/index.html", "text/html; charset=utf-8")) {
       server->send(404, "text/plain", "indexEN.html missing in LittleFS");
     }
   });
 
   // Instrukcja (PL)
   server->on("/instrukcja.txt", HTTP_GET, []() {
-    if (littleFsReady && LittleFS.exists("/instrukcja.txt")) {
-      File f = LittleFS.open("/instrukcja.txt", "r");
-      server->streamFile(f, "text/plain; charset=utf-8");
-      f.close();
-    } else {
+    if (!streamLittleFsFile("/instrukcja.txt", "text/plain; charset=utf-8")) {
       server->send(404, "text/plain", "instrukcja.txt missing in LittleFS");
     }
   });
 
   // Manual (EN)
   server->on("/manual.txt", HTTP_GET, []() {
-    if (littleFsReady && LittleFS.exists("/manual.txt")) {
-      File f = LittleFS.open("/manual.txt", "r");
-      server->streamFile(f, "text/plain; charset=utf-8");
-      f.close();
-    } else {
+    if (!streamLittleFsFile("/manual.txt", "text/plain; charset=utf-8")) {
       server->send(404, "text/plain", "manual.txt missing in LittleFS");
+    }
+  });
+
+  // Arkusze stylów CSS (wspólne + desktop/mobile)
+  server->on("/style.css", HTTP_GET, []() {
+    if (!streamLittleFsFile("/style.css", "text/css; charset=utf-8")) {
+      server->send(404, "text/plain", "style.css missing in LittleFS");
+    }
+  });
+
+  server->on("/style.base.css", HTTP_GET, []() {
+    if (!streamLittleFsFile("/style.base.css", "text/css; charset=utf-8")) {
+      server->send(404, "text/plain", "style.base.css missing in LittleFS");
+    }
+  });
+
+  server->on("/style.desktop.css", HTTP_GET, []() {
+    if (!streamLittleFsFile("/style.desktop.css", "text/css; charset=utf-8")) {
+      server->send(404, "text/plain", "style.desktop.css missing in LittleFS");
+    }
+  });
+
+  server->on("/style.mobile.css", HTTP_GET, []() {
+    if (!streamLittleFsFile("/style.mobile.css", "text/css; charset=utf-8")) {
+      server->send(404, "text/plain", "style.mobile.css missing in LittleFS");
     }
   });
   
   // Strona konfiguracji
   server->on("/config", HTTP_GET, []() {
-    if (littleFsReady && LittleFS.exists("/index.html")) {
-      File f = LittleFS.open("/index.html", "r");
-      server->streamFile(f, "text/html; charset=utf-8");
-      f.close();
-    } else {
+    if (!streamLittleFsFile("/index.html", "text/html; charset=utf-8")) {
       server->send(200, "text/html; charset=utf-8", getConfigHTML());
     }
   });
@@ -12441,6 +16294,31 @@ void setupWebServer() {
     serializeJson(doc, json);
     server->send(200, "application/json", json);
   });
+
+  // API - Propagation + HF Band Info
+  server->on("/api/propagation", HTTP_GET, []() {
+    StaticJsonDocument<2048> doc;
+    doc["valid"] = propagationData.valid;
+    doc["sfi"] = propagationData.sfi;
+    doc["kindex"] = propagationData.kindex;
+    doc["aindex"] = propagationData.aindex;
+    doc["muf"] = propagationData.muf;
+    doc["updated"] = propagationData.updated;
+    doc["lastError"] = propagationData.lastError;
+
+    JsonArray bands = doc.createNestedArray("hfBands");
+    for (int i = 0; i < 4; i++) {
+      JsonObject band = bands.createNestedObject();
+      band["label"] = propagationData.hfBandLabel[i];
+      band["freq"] = propagationData.hfBandFreq[i];
+      band["day"] = propagationData.hfBandDay[i];
+      band["night"] = propagationData.hfBandNight[i];
+    }
+
+    String json;
+    serializeJson(doc, json);
+    server->send(200, "application/json", json);
+  });
   
   // API - zapisz konfiguracjÄ™
   server->on("/api/save", HTTP_POST, []() {
@@ -12461,6 +16339,57 @@ void setupWebServer() {
       }
       if (doc["wifi_pass2"].is<String>()) {
         wifiPassword2 = doc["wifi_pass2"].as<String>();
+      }
+      if (doc["uart2_mode"].is<String>()) {
+        uart2Mode = uart2ModeFromCode(doc["uart2_mode"].as<String>());
+      }
+      if (doc.containsKey("uart2_baud")) {
+        int uart2BaudCandidate = (int)uart2BaudRate;
+        if (doc["uart2_baud"].is<int>()) {
+          uart2BaudCandidate = doc["uart2_baud"].as<int>();
+        } else if (doc["uart2_baud"].is<long>()) {
+          uart2BaudCandidate = (int)doc["uart2_baud"].as<long>();
+        } else if (doc["uart2_baud"].is<float>() || doc["uart2_baud"].is<double>()) {
+          uart2BaudCandidate = (int)doc["uart2_baud"].as<double>();
+        } else if (doc["uart2_baud"].is<String>()) {
+          String uart2BaudStr = doc["uart2_baud"].as<String>();
+          uart2BaudStr.trim();
+          uart2BaudCandidate = uart2BaudStr.toInt();
+        }
+        applyUart2BaudRate(uart2BaudCandidate);
+      }
+      if (doc.containsKey("uart2_data_bits")) {
+        int uart2DataBitsCandidate = (int)uart2DataBits;
+        if (doc["uart2_data_bits"].is<int>()) {
+          uart2DataBitsCandidate = doc["uart2_data_bits"].as<int>();
+        } else if (doc["uart2_data_bits"].is<long>()) {
+          uart2DataBitsCandidate = (int)doc["uart2_data_bits"].as<long>();
+        } else if (doc["uart2_data_bits"].is<float>() || doc["uart2_data_bits"].is<double>()) {
+          uart2DataBitsCandidate = (int)doc["uart2_data_bits"].as<double>();
+        } else if (doc["uart2_data_bits"].is<String>()) {
+          String uart2DataBitsStr = doc["uart2_data_bits"].as<String>();
+          uart2DataBitsStr.trim();
+          uart2DataBitsCandidate = uart2DataBitsStr.toInt();
+        }
+        applyUart2DataBits(uart2DataBitsCandidate);
+      }
+      if (doc["uart2_parity"].is<String>()) {
+        uart2Parity = uart2ParityFromCode(doc["uart2_parity"].as<String>());
+      }
+      if (doc.containsKey("uart2_stop_bits")) {
+        int uart2StopBitsCandidate = (int)uart2StopBits;
+        if (doc["uart2_stop_bits"].is<int>()) {
+          uart2StopBitsCandidate = doc["uart2_stop_bits"].as<int>();
+        } else if (doc["uart2_stop_bits"].is<long>()) {
+          uart2StopBitsCandidate = (int)doc["uart2_stop_bits"].as<long>();
+        } else if (doc["uart2_stop_bits"].is<float>() || doc["uart2_stop_bits"].is<double>()) {
+          uart2StopBitsCandidate = (int)doc["uart2_stop_bits"].as<double>();
+        } else if (doc["uart2_stop_bits"].is<String>()) {
+          String uart2StopBitsStr = doc["uart2_stop_bits"].as<String>();
+          uart2StopBitsStr.trim();
+          uart2StopBitsCandidate = uart2StopBitsStr.toInt();
+        }
+        applyUart2StopBits(uart2StopBitsCandidate);
       }
       clusterHost = doc["cluster_host"].as<String>();
       if (doc["pota_host"].is<String>()) {
@@ -12486,10 +16415,10 @@ void setupWebServer() {
       }
       userCallsign = doc["user_callsign"].as<String>();
       userLocator = doc["user_locator"].as<String>();
-      if (doc["timezone"].is<int>()) {
-        timezoneHours = doc["timezone"].as<int>();
-        if (timezoneHours < -12) timezoneHours = -12;
-        if (timezoneHours > 14) timezoneHours = 14;
+      if (doc["timezone"].is<float>() || doc["timezone"].is<double>() || doc["timezone"].is<int>()) {
+        timezoneHours = doc["timezone"].as<float>();
+        if (timezoneHours < -12.0f) timezoneHours = -12.0f;
+        if (timezoneHours > 14.0f) timezoneHours = 14.0f;
       }
       
       // WspĂłĹ‚rzÄ™dne geograficzne (LAT/LON)
@@ -12513,6 +16442,12 @@ void setupWebServer() {
         // JeĹ›li podano tylko jednÄ… wspĂłĹ‚rzÄ™dnÄ…, uznaj za nieprawidĹ‚owe
         userLatLonValid = false;
       }
+      if (doc["use_gps_if_active"].is<bool>()) {
+        useGpsIfActive = doc["use_gps_if_active"].as<bool>();
+      }
+      if (doc.containsKey("uart2_connected_module")) {
+        uart2ConnectedModule = sanitizeUart2ConnectedModule(doc["uart2_connected_module"].as<String>());
+      }
       
       if (doc["qrz_user"].is<String>()) {
         qrzUsername = doc["qrz_user"].as<String>();
@@ -12531,6 +16466,11 @@ void setupWebServer() {
         if (backlightPercent < MIN_BACKLIGHT_PERCENT) backlightPercent = MIN_BACKLIGHT_PERCENT;
         if (backlightPercent > 100) backlightPercent = 100;
       }
+      if (doc["tft_night_dimming"].is<int>()) {
+        tftNightDimmingPercent = doc["tft_night_dimming"].as<int>();
+        if (tftNightDimmingPercent < 0) tftNightDimmingPercent = 0;
+        if (tftNightDimmingPercent > 100) tftNightDimmingPercent = 100;
+      }
       if (doc["tft_invert"].is<bool>()) {
         tftInvertColors = doc["tft_invert"].as<bool>();
       }
@@ -12539,6 +16479,14 @@ void setupWebServer() {
       } else if (doc["tft_lang"].is<int>()) {
         int lang = doc["tft_lang"].as<int>();
         tftLanguage = (lang == TFT_LANG_EN) ? TFT_LANG_EN : TFT_LANG_PL;
+      }
+      if (doc["tft_style"].is<String>()) {
+        tftStyleMode = tftStyleFromCode(doc["tft_style"].as<String>());
+        applyTftUiPalette();
+      } else if (doc["tft_style"].is<int>()) {
+        int styleMode = doc["tft_style"].as<int>();
+        tftStyleMode = (styleMode == TFT_STYLE_LIGHT) ? TFT_STYLE_LIGHT : TFT_STYLE_DARK;
+        applyTftUiPalette();
       }
       if (doc["table_size"].is<String>()) {
         dxTableSizeMode = dxTableSizeFromCode(doc["table_size"].as<String>());
@@ -12657,6 +16605,34 @@ void setupWebServer() {
           alertDistanceCandidate = alertDistanceStr.toFloat();
         }
         applyAprsAlertDistanceKm(alertDistanceCandidate);
+      }
+      if (doc["weather_alert_storm_enabled"].is<bool>()) {
+        weatherAlertStormEnabled = doc["weather_alert_storm_enabled"].as<bool>();
+        if (!weatherAlertStormEnabled) {
+          nextWeatherStormAlertMs = 0;
+        }
+      }
+      if (doc["weather_alert_wind_enabled"].is<bool>()) {
+        weatherAlertWindEnabled = doc["weather_alert_wind_enabled"].as<bool>();
+        if (!weatherAlertWindEnabled) {
+          nextWeatherWindAlertMs = 0;
+        }
+      }
+      if (doc.containsKey("weather_alert_wind_threshold_ms")) {
+        float windThresholdCandidate = weatherAlertWindThresholdMs;
+        if (doc["weather_alert_wind_threshold_ms"].is<float>() || doc["weather_alert_wind_threshold_ms"].is<double>()) {
+          windThresholdCandidate = (float)doc["weather_alert_wind_threshold_ms"].as<double>();
+        } else if (doc["weather_alert_wind_threshold_ms"].is<int>()) {
+          windThresholdCandidate = (float)doc["weather_alert_wind_threshold_ms"].as<int>();
+        } else if (doc["weather_alert_wind_threshold_ms"].is<long>()) {
+          windThresholdCandidate = (float)doc["weather_alert_wind_threshold_ms"].as<long>();
+        } else if (doc["weather_alert_wind_threshold_ms"].is<String>()) {
+          String windThresholdStr = doc["weather_alert_wind_threshold_ms"].as<String>();
+          windThresholdStr.trim();
+          windThresholdStr.replace(',', '.');
+          windThresholdCandidate = windThresholdStr.toFloat();
+        }
+        applyWeatherAlertWindThresholdMs(windThresholdCandidate);
       }
       if (doc["enable_led_alert"].is<bool>()) {
         enableLedAlert = doc["enable_led_alert"].as<bool>();
@@ -12796,11 +16772,18 @@ void setupWebServer() {
       if (potaApiUrl.length() == 0) {
         potaApiUrl = DEFAULT_POTA_API_URL;
       }
-      if (hamalertHost.length() == 0) {
-        hamalertHost = DEFAULT_HAMALERT_HOST;
-      }
-      if (hamalertPort <= 0 || hamalertPort > 65535) {
-        hamalertPort = DEFAULT_HAMALERT_PORT;
+      bool hamalertCredentialsProvided = (hamalertLogin.length() > 0 && hamalertPassword.length() > 0);
+      if (hamalertCredentialsProvided) {
+        if (hamalertHost.length() == 0) {
+          hamalertHost = DEFAULT_HAMALERT_HOST;
+        }
+        if (hamalertPort <= 0 || hamalertPort > 65535) {
+          hamalertPort = DEFAULT_HAMALERT_PORT;
+        }
+      } else {
+        // Empty login/password means HAMALERT is intentionally disabled.
+        hamalertHost = "";
+        hamalertPort = 0;
       }
 
       // Kolejność ekranów konfigurowana z WWW
@@ -12917,6 +16900,103 @@ void setupWebServer() {
     server->send(200, "application/json", "{\"status\":\"ok\"}");
   });
 
+  // API - status runtime UART2 (GPS/BT)
+  server->on("/api/uart_status", HTTP_GET, []() {
+    StaticJsonDocument<256> doc;
+    unsigned long nowMs = millis();
+    bool gpsMode = isUart2GpsParsingEnabled();
+    bool btMode = (uart2Mode == UART2_MODE_BT);
+
+    doc["uart2_mode"] = uart2ModeToCode(uart2Mode);
+    doc["uart2_connected_module"] = uart2ConnectedModule;
+    doc["gps_active"] = gpsMode && isGpsUartActive(nowMs);
+    doc["gps_fix"] = gpsMode && gpsLocationValid && isGpsFixActive(nowMs);
+    doc["bt_active"] = btMode;
+    doc["aprs_uart_active"] = isUart2AprsUartSourceEnabled();
+
+    String json;
+    serializeJson(doc, json);
+    server->send(200, "application/json", json);
+  });
+
+  // API - status skanera/parowania BT SPP dla ESP32-BRIDGE
+  server->on("/api/bridge_bt_status", HTTP_GET, []() {
+    StaticJsonDocument<4096> doc;
+    doc["enabled"] = isUart2BridgeModuleSelected();
+    doc["scan_in_progress"] = bridgeBtScanInProgress;
+    doc["list_collecting"] = bridgeBtListCollecting;
+    doc["list_expected"] = bridgeBtListExpected;
+    doc["last_error"] = bridgeBtLastError;
+    doc["last_ack"] = bridgeBtLastAck;
+    doc["disc_status"] = bridgeBtLastDiscStatus;
+    doc["last_scan_ms"] = bridgeBtLastScanMs;
+    doc["pair_pending"] = bridgeBtPairPending;
+    doc["pair_result"] = (bridgeBtPairLastResult > 0) ? "ok" : ((bridgeBtPairLastResult < 0) ? "err" : "none");
+    doc["pair_result_ms"] = bridgeBtPairLastResultMs;
+    doc["paired_name"] = bridgeBtPairedName;
+    doc["paired_addr"] = formatBridgeBtAddressForDisplay(bridgeBtPairedAddress);
+
+    JsonArray devices = doc.createNestedArray("devices");
+    for (int i = 0; i < bridgeBtDeviceCount; i++) {
+      JsonObject d = devices.createNestedObject();
+      d["name"] = bridgeBtDevices[i].name;
+      d["addr"] = formatBridgeBtAddressForDisplay(bridgeBtDevices[i].addressNoColon);
+      d["addr_raw"] = bridgeBtDevices[i].addressNoColon;
+    }
+
+    String json;
+    serializeJson(doc, json);
+    server->send(200, "application/json", json);
+  });
+
+  // API - uruchom skan BT SPP dla ESP32-BRIDGE
+  server->on("/api/bridge_bt_scan", HTTP_POST, []() {
+    if (!isUart2BridgeModuleSelected()) {
+      server->send(400, "application/json", "{\"status\":\"error\",\"message\":\"bridge_mode_required\"}");
+      return;
+    }
+
+    startBridgeScanSequence();
+    server->send(200, "application/json", "{\"status\":\"ok\",\"action\":\"scan_started\"}");
+  });
+
+  // API - sparuj/połącz z urządzeniem BT SPP
+  server->on("/api/bridge_bt_pair", HTTP_POST, []() {
+    if (!isUart2BridgeModuleSelected()) {
+      server->send(400, "application/json", "{\"status\":\"error\",\"message\":\"bridge_mode_required\"}");
+      return;
+    }
+
+    if (!server->hasArg("plain")) {
+      server->send(400, "application/json", "{\"status\":\"error\",\"message\":\"missing_payload\"}");
+      return;
+    }
+
+    StaticJsonDocument<512> doc;
+    DeserializationError err = deserializeJson(doc, server->arg("plain"));
+    if (err) {
+      server->send(400, "application/json", "{\"status\":\"error\",\"message\":\"json_parse\"}");
+      return;
+    }
+
+    String name = doc["name"].is<String>() ? doc["name"].as<String>() : "";
+    String addr = doc["address"].is<String>() ? doc["address"].as<String>() : "";
+    String password = doc["password"].is<String>() ? doc["password"].as<String>() : "";
+    if (password.length() > 16) {
+      server->send(400, "application/json", "{\"status\":\"error\",\"message\":\"password_too_long\"}");
+      return;
+    }
+
+    if (!requestBridgePairConnect(name, addr, password, true)) {
+      String msg = bridgeBtLastError.length() ? bridgeBtLastError : String("pair_start_failed");
+      msg.replace("\"", "'");
+      server->send(400, "application/json", String("{\"status\":\"error\",\"message\":\"") + msg + "\"}");
+      return;
+    }
+
+    server->send(200, "application/json", "{\"status\":\"ok\",\"action\":\"pair_started\"}");
+  });
+
   // API - resetuj rotację TFT do wartości domyślnych
   server->on("/api/reset_tft_rotation", HTTP_POST, []() {
     tftRotation = 1;
@@ -12935,6 +17015,13 @@ void setupWebServer() {
     doc["wifi_pass"] = wifiPassword;
     doc["wifi_ssid2"] = wifiSSID2;
     doc["wifi_pass2"] = wifiPassword2;
+    doc["uart2_mode"] = uart2ModeToCode(uart2Mode);
+    doc["uart2_baud"] = uart2BaudRate;
+    doc["uart2_data_bits"] = uart2DataBits;
+    doc["uart2_parity"] = uart2ParityToCode(uart2Parity);
+    doc["uart2_stop_bits"] = uart2StopBits;
+    doc["uart2_rx_pin"] = GPS_UART_RX_PIN;
+    doc["uart2_tx_pin"] = GPS_UART_TX_PIN;
     doc["cluster_host"] = clusterHost;
     doc["cluster_port"] = clusterPort;
     doc["pota_host"] = potaClusterHost;
@@ -12951,14 +17038,20 @@ void setupWebServer() {
     doc["user_lat"] = userLat;
     doc["user_lon"] = userLon;
     doc["user_lat_lon_valid"] = userLatLonValid;
+    doc["use_gps_if_active"] = useGpsIfActive;
+    doc["uart2_connected_module"] = uart2ConnectedModule;
+    doc["bridge_paired_name"] = bridgeBtPairedName;
+    doc["bridge_paired_addr"] = formatBridgeBtAddressForDisplay(bridgeBtPairedAddress);
     doc["qrz_user"] = qrzUsername;
     doc["qrz_pass"] = qrzPassword;
     doc["weather_key"] = weatherApiKey;
     doc["openwebrx_url"] = openWebRxUrl;
     doc["tft_backlight"] = backlightPercent;
+    doc["tft_night_dimming"] = tftNightDimmingPercent;
     doc["tft_invert"] = tftInvertColors;
     doc["tft_rotation"] = tftRotation;
     doc["tft_lang"] = tftLangToCode(tftLanguage);
+    doc["tft_style"] = tftStyleToCode(tftStyleMode);
     doc["table_size"] = dxTableSizeToCode(dxTableSizeMode);
     doc["tft_auto_switch"] = tftAutoSwitchEnabled;
     doc["tft_switch_time_sec"] = tftAutoSwitchTimeSec;
@@ -12982,6 +17075,9 @@ void setupWebServer() {
     doc["aprs_alert_enabled"] = aprsAlertEnabled;
     doc["aprs_alert_nearby_enabled"] = aprsAlertNearbyEnabled;
     doc["aprs_alert_wx_enabled"] = aprsAlertWxEnabled;
+    doc["weather_alert_storm_enabled"] = weatherAlertStormEnabled;
+    doc["weather_alert_wind_enabled"] = weatherAlertWindEnabled;
+    doc["weather_alert_wind_threshold_ms"] = weatherAlertWindThresholdMs;
     doc["aprs_alert_min_sec"] = aprsAlertMinSeconds;
     doc["aprs_alert_screen_sec"] = aprsAlertScreenSeconds;
     doc["aprs_alert_distance_km"] = aprsAlertDistanceKm;
@@ -13081,7 +17177,7 @@ void uiTaskLoop(void *parameter) {
         drawScreen(currentScreen);
       }
 
-      if (aprsAlertDrawPending) {
+      if (aprsAlertDrawPending && !brightnessMenuActive) {
         APRSStation pendingStation;
         portENTER_CRITICAL(&aprsAlertPendingMux);
         pendingStation = aprsAlertPendingStation;
@@ -13089,12 +17185,23 @@ void uiTaskLoop(void *parameter) {
         portEXIT_CRITICAL(&aprsAlertPendingMux);
         ALERT_Screen(pendingStation);
       }
+      if (weatherAlertDrawPending && !brightnessMenuActive && !aprsAlertScreenActive) {
+        WeatherAlertInfo pendingInfo;
+        portENTER_CRITICAL(&weatherAlertPendingMux);
+        pendingInfo = weatherAlertPendingInfo;
+        weatherAlertDrawPending = false;
+        portEXIT_CRITICAL(&weatherAlertPendingMux);
+        WEATHER_ALERT_Screen(pendingInfo);
+      }
       updateAlertScreenTimeout();
       handleTouchNavigation();
     }
 
-    if (tftAutoSwitchEnabled && tftInitialized && !inMenu && !aprsAlertScreenActive && !touchCalActive && !brightnessMenuActive) {
+    if (tftAutoSwitchEnabled && tftInitialized && !inMenu && !aprsAlertScreenActive && !touchCalActive && !brightnessMenuActive && currentScreen != SCREEN_UNLIS_HUNTER) {
       unsigned long nowSwitch = millis();
+      if (autoswitchPausedUntilMs > 0 && nowSwitch < autoswitchPausedUntilMs) {
+        // autoswitch zapauzowany po dotknięciu środka ekranu
+      } else {
       if (tftAutoSwitchLastMs == 0 || tftAutoSwitchLastScreen != currentScreen) {
         tftAutoSwitchLastMs = nowSwitch;
         tftAutoSwitchLastScreen = currentScreen;
@@ -13110,6 +17217,7 @@ void uiTaskLoop(void *parameter) {
           tftAutoSwitchLastScreen = currentScreen;
         }
       }
+      } // koniec else (autoswitch nie zapauzowany)
     }
 
     if (!restartRequested) {
@@ -13173,6 +17281,13 @@ void uiTaskLoop(void *parameter) {
         }
       }
 
+      if (tftInitialized && currentScreen == SCREEN_LOKALIZACJA && !inMenu && !aprsAlertScreenActive) {
+        if (now - lastScreenLocationUpdateMs > 1000) {
+          updateLokalizacjaFields();
+          lastScreenLocationUpdateMs = now;
+        }
+      }
+
       if (tftInitialized && currentScreen == SCREEN_MATRIX_CLOCK && !inMenu && !aprsAlertScreenActive) {
         updateScreen10();
       }
@@ -13203,11 +17318,28 @@ void setup() {
   delay(200);
   esp_rom_printf("APP: Serial.begin done\n");
 
+  gpsNmeaLine.reserve(180);
+  gpsLastRxMs = 0;
+  gpsRawBridgeStartMs = 0;
+  gpsRawBridgeEndLogged = true;
+  gpsRawLastStatsMs = 0;
+  gpsRawBytesTotal = 0;
+  gpsRawBytesSinceStats = 0;
+
   // Daj chwilÄ™ na ustabilizowanie WiFi/PHY po resecie (zwĹ‚aszcza na "Super Mini")
   delay(300);
 
   if (dxSpotsMutex == nullptr) {
     dxSpotsMutex = xSemaphoreCreateMutex();
+  }
+  if (potaSpotsMutex == nullptr) {
+    potaSpotsMutex = xSemaphoreCreateMutex();
+  }
+  if (hamalertSpotsMutex == nullptr) {
+    hamalertSpotsMutex = xSemaphoreCreateMutex();
+  }
+  if (weatherDataMutex == nullptr) {
+    weatherDataMutex = xSemaphoreCreateMutex();
   }
 
   initStatusRgbLed();
@@ -13221,6 +17353,7 @@ void setup() {
 #endif
 
   littleFsReady = LittleFS.begin(true);
+  logRamUsage(millis());
   if (littleFsReady) {
     bootLogLine("LittleFS OK");
     if (LittleFS.exists(ROBOTO_FONT20_FILE)) {
@@ -13262,10 +17395,12 @@ void setup() {
   weatherData.cityName.reserve(48);
   weatherData.forecast3hDesc.reserve(64);
   weatherData.forecastNextDayDesc.reserve(64);
+  weatherData.forecastError.reserve(80);
   weatherData.lastError.reserve(64);
   weatherData.iconCode.reserve(8);
   propagationData.lastError.reserve(48);
   yield();
+  configureUart2Port();
 #ifdef ENABLE_TFT_DISPLAY
   applyTftRotation();
   applyTouchRotation();
@@ -13276,6 +17411,7 @@ void setup() {
   if (wifiSSID.length() > 0) {
     bootLogLine("Connecting WiFi: " + wifiSSID);
     if (connectToWiFi()) {
+      wifiConnectedAtMs = millis();
       bootLogLine("WiFi connected!");
       yield();
       updateNTPTime();
@@ -13303,9 +17439,15 @@ void setup() {
   // Aktualizuj wyĹ›wietlacz TFT (ekran startowy)
 #ifdef ENABLE_TFT_DISPLAY
   drawWelcomeScreenYellow();
-  delay(2000);
+  delayWithRamLogs(4000);
   drawWelcomeScreenGreen();
-  delay(3000);
+  delayWithRamLogs(3000);
+
+  if (littleFsReady) {
+    warmupSmoothFonts();
+  }
+  logRamUsage(millis());
+
   bootSequenceActive = false;
   drawScreen(currentScreen);
   resetTftAutoSwitchTimer();
@@ -13337,6 +17479,29 @@ void loop() {
   // Feed watchdog
   yield();
 
+  logRamUsage(now);
+  pollGpsSerial();
+  serviceBridgeBtsppOnRetry(now);
+  serviceBridgeBootForceCommands(now);
+  serviceAprsTncBootRestart(now);
+  logGpsStatusEvery5s(now);
+
+  bool gpsTimeActiveNow = isGpsTimeSourceActive(now);
+  if (gpsTimeActiveNow) {
+    syncSystemTimeFromGps(now);
+  }
+
+  if (gpsTimeActiveNow != gpsTimeSourceWasActive) {
+    if (gpsTimeActiveNow) {
+      Serial.printf("[TIME] Zrodlo czasu: GPS FIX (%s)\n", formatGpsUtcForLog().c_str());
+    } else {
+      Serial.println("[TIME] Zrodlo czasu: fallback NTP/www (brak aktywnego GPS FIX)");
+      // WymuĹ› odĹ›wieĹĽenie NTP zaraz po utracie GPS.
+      lastNTPUpdate = 0;
+    }
+    gpsTimeSourceWasActive = gpsTimeActiveNow;
+  }
+
   // Odroczony restart (ĹĽeby odpowiedĹş HTTP zdÄ…ĹĽyĹ‚a wyjĹ›Ä‡)
   if (restartRequested && (long)(millis() - restartAtMs) >= 0) {
     LOGV_PRINTLN("[LOOP] Restart requested - restarting...");
@@ -13355,6 +17520,7 @@ void loop() {
   // ObsĹ‚uga WiFi
   if (!wifiConnected && WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
+    wifiConnectedAtMs = now;
     Serial.print("STA połączone…czone. IP: ");
     Serial.println(WiFi.localIP());
     // Jeżeli wcześniej był uruchomiony AP do konfiguracji, wyłącz go po udanym połączeniu STA,
@@ -13369,19 +17535,29 @@ void loop() {
     updateNTPTime();
     connectToCluster();
     connectToPotaCluster();
-    connectToAPRS(); // Połącz również z APRS-IS
   } else if (wifiConnected && WiFi.status() != WL_CONNECTED) {
     LOGV_PRINTLN("[LOOP] WiFi status zmieniony: połączony -> rozłączony");
     wifiConnected = false;
     telnetConnected = false;
     potaTelnetConnected = false;
     aprsConnected = false;
+    if (aprsClient.connected()) {
+      aprsClient.stop();
+    }
     LOGV_PRINTLN("[LOOP] STA rozłączone (wracam do trybu offline/AP jeśli aktywne).");
   }
 
   updateStatusRgbLed();
 
+  // W trybie STA okresowo ponawiaj aktywną próbę połączenia.
+  retryWiFiFromSTAIfDue(now);
+
+  // W trybie AP okresowo podejmuj bezpieczną próbę powrotu do STA.
+  retryWiFiFromAPIfDue(now);
+
   // Jeśli jesteśmy offline, zostajemy w AP (portal) — stabilnie.
+
+  const bool networkServicesReady = wifiConnected && ((now - wifiConnectedAtMs) >= NETWORK_SERVICES_START_DELAY_MS);
   
   // Obsługa Telnet
   if (wifiConnected) {
@@ -13394,7 +17570,7 @@ void loop() {
   }
 
   // Obsługa POTA Telnet
-  if (wifiConnected) {
+  if (networkServicesReady) {
     // Tryb HTTP API zamiast Telnetu (źródło: https://api.pota.app/v1/spots)
     if (lastPotaApiFetchMs == 0 || now - lastPotaApiFetchMs > POTA_API_FETCH_INTERVAL_MS) {
       if (fetchPotaApi()) {
@@ -13412,40 +17588,43 @@ void loop() {
     }
   }
 
-  // ObsĹ‚uga APRS-IS
-  if (wifiConnected) {
-    if (!aprsConnected) {
-      LOGV_PRINTLN("[LOOP] WiFi OK, prĂłba poĹ‚Ä…czenia z APRS-IS...");
-      connectToAPRS();
-    } else {
-      handleAPRSData();
-      unsigned long nowAprs = millis();
-
-      if (aprsBeaconEnabled && aprsLoginSent && userLatLonValid) {
-        if (nextAPRSPositionDueMs == 0) {
-          nextAPRSPositionDueMs = nowAprs + APRS_POSITION_FIRST_DELAY_MS;
-        } else if ((long)(nowAprs - nextAPRSPositionDueMs) >= 0) {
-          sendAprsPosition();
-          nextAPRSPositionDueMs = nowAprs + aprsPositionIntervalMs;
-        }
+  // ObsĹ‚uga APRS-IS (wylaczona, gdy APRS idzie z UART2 TNC)
+  if (networkServicesReady) {
+    if (isAprsNetworkFeedEnabled()) {
+      if (!aprsConnected) {
+        LOGV_PRINTLN("[LOOP] WiFi OK, prĂłba poĹ‚Ä…czenia z APRS-IS...");
+        connectToAPRS();
       } else {
-        nextAPRSPositionDueMs = 0; // Reset harmonogramu gdy beacon jest wyłączony lub brak loginu/koordynat
-        aprsBeaconTxCount = 0;
+        handleAPRSData();
+        unsigned long nowAprs = millis();
+        refreshAprsFilterIfNeeded(nowAprs);
+        
+        // Watchdog APRS: jeĹ›li brak danych przez dĹ‚uĹĽszy czas, zrĂłb reconnect
+        unsigned long inactivityTime = nowAprs - lastAPRSRxMs;
+        if (inactivityTime > APRS_INACTIVITY_RECONNECT_MS) {
+          LOGV_PRINT("[LOOP] WARNING: Brak danych z APRS-IS przez ");
+          LOGV_PRINT(inactivityTime / 1000);
+          LOGV_PRINTLN(" sekund -> reconnect");
+          aprsClient.stop();
+          aprsConnected = false;
+          aprsLoginSent = false;
+          // connectToAPRS() odpali siÄ™ w kolejnych iteracjach
+        }
       }
-      
-      // Watchdog APRS: jeĹ›li brak danych przez dĹ‚uĹĽszy czas, zrĂłb reconnect
-      unsigned long inactivityTime = nowAprs - lastAPRSRxMs;
-      if (inactivityTime > APRS_INACTIVITY_RECONNECT_MS) {
-        LOGV_PRINT("[LOOP] WARNING: Brak danych z APRS-IS przez ");
-        LOGV_PRINT(inactivityTime / 1000);
-        LOGV_PRINTLN(" sekund -> reconnect");
+    } else {
+      if (aprsConnected || aprsClient.connected()) {
         aprsClient.stop();
-        aprsConnected = false;
-        aprsLoginSent = false;
-        // connectToAPRS() odpali siÄ™ w kolejnych iteracjach
+      }
+      aprsConnected = false;
+      aprsLoginSent = false;
+      if (!isUart2AprsTncKissModuleSelected()) {
+        nextAPRSPositionDueMs = 0;
+        aprsBeaconTxCount = 0;
       }
     }
   }
+
+  serviceAprsBeaconTx(now);
 
   // Aktualizuj dane propagacyjne (hamqsl solarxml)
   if (wifiConnected) {
@@ -13500,9 +17679,19 @@ void loop() {
     if (lastWeatherFetchMs == 0 || now - lastWeatherFetchMs > interval) {
       lastWeatherFetchOk = fetchWeatherData();
       lastWeatherFetchMs = now;
-
+      applyBacklightByDayNight(true);
     }
   }
+
+  // Weryfikacja dzień/noc z OWM co 5 minut i dostosowanie podświetlenia TFT
+  if (tftInitialized && !brightnessMenuActive) {
+    if (lastBacklightDayNightCheckMs == 0 || (now - lastBacklightDayNightCheckMs) >= BACKLIGHT_DAY_NIGHT_CHECK_INTERVAL_MS) {
+      applyBacklightByDayNight(false);
+      lastBacklightDayNightCheckMs = now;
+    }
+  }
+
+  processWeatherAlertSchedule();
 
   // Przetwarzaj maks. 1 liniÄ™ telnet na iteracjÄ™ (ĹĽeby nie zamroziÄ‡ WWW/UI)
   if (pendingTelnetLine.length() > 0) {
@@ -13626,7 +17815,7 @@ void loop() {
         telnetClient.print("\r\n");
         clusterLoginSent = true;
         lastClusterKeepAliveMs = millis();
-        Serial.println("[CLUSTER] Login wysĹ‚any");
+        Serial.println("[CLUSTER] Login wys\u0142any");
         
         // Po zalogowaniu wyĹ›lij komendy konfiguracyjne CC-Cluster (z opĂłĹşnieniem)
         // Daj czas clusterowi na przetworzenie loginu

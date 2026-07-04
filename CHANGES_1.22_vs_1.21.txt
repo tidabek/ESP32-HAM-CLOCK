@@ -1,0 +1,50 @@
+ESP32-HAM-CLOCK
+Changes in version 1.22 compared to 1.21
+
+1) Stability and performance
+- Added separate mutexes for POTA and HAMALERT spot lists (protecting access from multiple code paths).
+- Reworked spot read/update sections to reduce the risk of data collisions.
+- Added periodic retry from AP mode back to WiFi STA (at a defined interval), without freezing the AP portal.
+
+2) DX Cluster
+- Fixed persistent saving of the "use filters" option in NVS (the previous key was too long for the ESP32 limit).
+- After the fix, the "use filters" checkbox state is correctly restored after restart.
+- DX filters are now enabled by default on a new configuration.
+- Default filter command is now: set/ft8
+
+3) TFT / device UI
+- Improved table column positioning (DX/POTA/HAMALERT) for better readability.
+- Extended BMP support from LittleFS (including 32-bit support), and added optional startup background from /logo.bmp.
+- Updated welcome screens (version 1.22 label, display times, text layout).
+- While UNLIS HUNTER screen is active, selected automatic actions are limited (including auto-switch/APRS alert popup) to avoid interrupting that screen.
+
+4) Web panel
+- Updated HAMALERT configuration logic: host/port/login/password fields are optional.
+- If HAMALERT login/password are empty, HAMALERT is treated as disabled.
+- Updated descriptions and helper hints in the form.
+- Updated DX Cluster field helper text to:
+  (e.g. dxspots.com port:7300, dxfun.com port:8000)
+
+5) Other
+- Updated version labels in the web panel and startup screen to 1.22.
+
+Migration notes:
+- After updating to 1.22, it is recommended to open the web configuration once and save settings again.
+- This is especially important for the DX Cluster section (filters), so the new NVS key is written.
+
+6) Today's fixes (2026-03-25)
+- WebSDR/KiwiSDR: fixed tune link generation to use Kiwi-compliant `f=` parameter instead of `tune=`.
+- SDR link generation is now mode-aware: CW spots force `cw` suffix (instead of automatic bandplan lsb/usb).
+- The SDR link fix applies to DX Cluster, POTA, and HAMALERT tables (shared link builder).
+- Web panel PL/EN: updated HAMALERT password label to "Haslo Telnet:" / "Telnet Password:".
+- TFT Propagation screen: added MUF parsing and display (hamqsl solarxml), between A-INDEX and UPDATED UTC.
+- TFT Propagation screen: removed bottom arrows and "SWITCH SCREEN" text; moved UPDATED UTC block lower.
+- Minor TFT layout tuning: adjusted K-INDEX and A-INDEX row positions per pixel-level corrections.
+- Added APRS ALERT lock while TFT settings menu is active (no trigger and no alert popup in that state).
+- Web panel PL/EN: added a new Propagation tab (between APRS and ALERT).
+- Added API endpoint `/api/propagation` exposing: SFI, K-INDEX, A-INDEX, MUF, UPDATED, `valid`, `lastError`, and `hfBands` (DAY/NIGHT).
+
+7) Timezone handling fix (2026-03-30)
+- Web panel and firmware: full support for half-hour timezone values (for example 2.5).
+- The timezoneHours variable and NVS/API read-write path now use float.
+- The web panel sends timezone as float (parseFloat), and firmware stores/reads it correctly.

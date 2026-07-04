@@ -2,6 +2,10 @@
 
 ESP32 HAM CLOCK to zegar i terminal DX/APRS dla ESP32 (głównie CYD ESP32-2432S028), z wyświetlaczem TFT 2.4" i równoległym panelem WWW.
 
+PROJEKT OBUDOWY do wydruku 3d dla tego projektu:
+
+https://makerworld.com/pl/models/2402822-datadisplay-v1-updated#profileId-2633814
+
 Projekt łączy:
 - DX Cluster (telnet),
 - POTA (API),
@@ -112,6 +116,13 @@ Projekt obsługuje 11 ekranów (kolejność konfigurowalna, każdy slot może by
 
 - PL: `INSTRUKCJA.txt` oraz `data/instrukcja.txt`
 - EN: `data/manual.txt` oraz `readmeEN.md`
+
+## Pliki zmian
+
+- Zmiany 1.22 vs 1.2: `ZMIANY_1.22_vs_1.2.txt`
+- Zmiany 1.22 vs 1.21: `ZMIANY_1.22_vs_1.21.txt`
+- Changes 1.22 vs 1.2: `CHANGES_1.22_vs_1.2.txt`
+- Changes 1.22 vs 1.21: `CHANGES_1.22_vs_1.21.txt`
 
 ## Szybkie troubleshooting
 

@@ -1,0 +1,50 @@
+ESP32-HAM-CLOCK
+Zmiany w wersji 1.22 wzgledem 1.21
+
+1) Stabilnosc i wydajnosc
+- Dodano osobne mutexy dla list spotow POTA i HAMALERT (ochrona dostepu z wielu miejsc kodu).
+- Uporzadkowano sekcje odczytu i aktualizacji spotow, aby ograniczyc ryzyko kolizji danych.
+- Dodano cykliczna probe powrotu z trybu AP do WiFi STA (co okreslony interwal), bez zawieszania portalu AP.
+
+2) DX Cluster
+- Naprawiono trwale zapisywanie opcji "uzyj filtrow" w NVS (poprzedni klucz byl za dlugi dla limitu ESP32).
+- Po poprawce stan checkboxa "uzyj filtrow" jest poprawnie odtwarzany po restarcie.
+- Domyslnie filtry DX sa wlaczone na nowej konfiguracji.
+- Domyslna komenda filtra ustawiona na: set/ft8
+
+3) TFT / UI urzadzenia
+- Poprawiono pozycjonowanie kolumn tabel (DX/POTA/HAMALERT) dla lepszej czytelnosci.
+- Rozszerzono obsluge BMP z LittleFS (m.in. wsparcie 32-bit), dodano mozliwosc tla startowego z /logo.bmp.
+- Dostosowano ekrany powitalne (wersja 1.22, czasy wyswietlania, rozmieszczenie napisow).
+- Podczas aktywnego ekranu UNLIS HUNTER ograniczono wybrane automatyczne akcje (m.in. auto-switch/APRS alert popup), aby nie przerywac pracy ekranu.
+
+4) Panel WWW
+- Zmieniono logike konfiguracji HAMALERT: pola host/port/login/haslo sa opcjonalne.
+- Gdy login/haslo HAMALERT sa puste, funkcja HAMALERT jest traktowana jako wylaczona.
+- Zaktualizowano opisy i podpowiedzi w formularzu.
+- Zmieniono opis pola DX Cluster na:
+  ( np. dxspots.com port:7300, dxfun.com port: 8000)
+
+5) Inne
+- Aktualizacja oznaczen wersji w panelu WWW i ekranie startowym do 1.22.
+
+Uwagi migracyjne:
+- Po aktualizacji do 1.22 zalecane jest jednokrotne wejscie do konfiguracji WWW i ponowny zapis ustawien.
+- Dotyczy to szczegolnie sekcji DX Cluster (filtry), aby nowy klucz NVS zostal zapisany.
+
+6) Dzisiejsze poprawki (2026-03-25)
+- WebSDR/KiwiSDR: poprawiono budowanie linkow do strojenia (parametr Kiwi `f=` zamiast `tune=`), zgodnie z dokumentacja.
+- Linkowanie SDR jest teraz zalezne od trybu spota: dla CW wymuszane jest `cw` (zamiast automatycznego lsb/usb z bandplanu).
+- Zmiany linkowania objely tabele DX Cluster, POTA i HAMALERT (wspolna funkcja budowania linku).
+- Panel WWW PL/EN: zmieniono etykiete hasla HAMALERT na "Haslo Telnet:" / "Telnet Password:".
+- Ekran Propagacja na TFT: dodano odczyt i wyswietlanie MUF (hamqsl solarxml), miedzy A-INDEX i UPDATED UTC.
+- Ekran Propagacja na TFT: usunieto dolne strzalki oraz napis "SWITCH SCREEN"; obnizono blok UPDATED UTC.
+- Drobne korekty ukladu TFT: przesunieto linie K-INDEX i A-INDEX zgodnie z korektami pikselowymi.
+- Dodano blokade APRS ALERT podczas aktywnego menu ustawien TFT (brak triggera i brak popupu alertu w tym stanie).
+- Panel WWW PL/EN: dodano nowa zakladke Propagacja (miedzy APRS i ALERT).
+- Dodano endpoint API `/api/propagation` udostepniajacy: SFI, K-INDEX, A-INDEX, MUF, UPDATED, `valid`, `lastError` oraz `hfBands` (DAY/NIGHT).
+
+7) Poprawka obslugi strefy czasowej (2026-03-30)
+- Panel WWW i firmware: pelna obsluga wartosci polowkowych (np. 2.5) dla strefy czasowej (timezone).
+- Zmienna timezoneHours oraz zapis/odczyt z NVS i API obsluguje teraz float.
+- Panel WWW wysyla wartosc jako float (parseFloat), a firmware poprawnie ja zapisuje i odczytuje.

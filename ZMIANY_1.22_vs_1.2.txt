@@ -1,0 +1,77 @@
+ESP32-HAM-CLOCK
+Zmiany w wersji 1.22 wzgledem 1.2
+
+Porownanie przygotowane na podstawie starszej wersji 1.2 z GitHub (tag v1.2.0)
+oraz obecnego stanu kodu 1.22 w repozytorium.
+
+1) Struktura projektu i publikacja kodu
+- Projekt jest przygotowany jako pelne zrodla dla PlatformIO.
+- Kod firmware znajduje sie w src/ESP32-HAM-CLOCK.ino.
+- Dodano pliki projektu i konfiguracji, m.in. platformio.ini oraz User_Setup.h.
+- Dodano osobne pliki WWW, instrukcje oraz README w wersji PL i EN.
+
+2) WiFi, AP i lacznosc
+- Dodano obsluge dwoch zestawow SSID/haslo (podstawowe i zapasowe).
+- Rozbudowano logike przechodzenia do trybu AP przy braku polaczenia WiFi.
+- Dodano cykliczne ponowne proby powrotu z AP do WiFi STA bez zatrzymywania portalu AP.
+- W obecnym kodzie tryb AP sprawdza co 5 minut, czy siec WiFi jest juz dostepna.
+- Dodano retry dla pracy w trybie STA oraz dodatkowe mechanizmy stabilizujace reconnect.
+
+3) DX Cluster, POTA i HAMALERT
+- Dodano i rozbudowano obsluge DX Cluster na TFT oraz w panelu WWW.
+- Dodano obsluge POTA przez API oraz osobny ekran / tabele POTA.
+- Dodano obsluge HAMALERT przez telnet oraz osobny ekran / tabele HAMALERT.
+- Poprawiono trwale zapisywanie opcji "use filters" dla DX Cluster w NVS.
+- Domyslna komenda filtra DX zostala ustawiona na: set/ft8.
+- Linki WebSDR/KiwiSDR sa budowane poprawnie dla obecnych spotow, lacznie z obsluga CW.
+
+4) Filtry ekranow TFT i panelu WWW
+- Filtry DX, POTA i HAMALERT na TFT zostaly przebudowane z trybu single-select na multi-select.
+- Filtry WWW PL i EN rowniez obsluguja teraz wybor wielu bandow i wielu mode jednoczesnie.
+- Zachowano ten sam wyglad kafelkow / przyciskow, zmieniona zostala tylko logika wyboru.
+- W biezacej wersji wybor tych filtrow nie jest zapisywany trwale do Preferences.
+
+5) APRS-IS, radar, beacon i alerty
+- Dodano ekran listy APRS-IS oraz ekran radarowy APRS.
+- Dodano sortowanie APRS: TIME / CALL / DIST.
+- Dodano beacon APRS z konfigurowanym interwalem, symbolem i komentarzem.
+- Dodano APRS ALERT dla wybranych znakow, stacji mobilnych i WX.
+- Dodano obsluge alertu LED oraz parametry czasu i migania.
+- Dodano blokade popupu APRS ALERT podczas aktywnego menu ustawien TFT.
+
+6) Pogoda, prognoza, propagacja i QRZ
+- Dodano ekran biezacej pogody.
+- Dodano ekran prognozy oraz odczyt PM2.5 / PM10.
+- Dodano ekran i zakladke Propagacja oraz endpoint API /api/propagation.
+- Dodano odczyt i wyswietlanie MUF z hamqsl solarxml.
+- Rozszerzono wykorzystanie QRZ do uzupelniania kraju, lokatora i dystansu dla spotow.
+
+7) TFT / UI urzadzenia
+- Dodano ustawienia jasnosci, jezyka TFT, wielkosci tabel, auto-switch i kolejnosci ekranow.
+- Dodano ustawienia TFT Rotation, Touch Rotation, inwersji kolorow i trybow zamiany osi dotyku.
+- Dodano menu dlugiego przytrzymania dla jasnosci oraz zmiany jezyka TFT.
+- Rozszerzono obsluge BMP z LittleFS, w tym wsparcie 32-bit oraz tlo startowe z /logo.bmp.
+- Zaktualizowano ekrany powitalne i oznaczenia wersji do 1.22.
+- Ograniczono wybrane automatyczne akcje podczas pracy ekranu UNLIS HUNTER, aby nie przerywac jego dzialania.
+
+8) Panel WWW
+- Dodano pelny panel WWW w jezyku polskim i angielskim.
+- Dodano zakladki dla DXSPOT, POTA, HAMALERT, APRS, ALERT, TFT, Ustawienia i Instrukcja.
+- Dodano nowa zakladke Propagacja.
+- Zmieniono logike konfiguracji HAMALERT: pola host/port/login/haslo sa opcjonalne.
+- Gdy login/haslo HAMALERT sa puste, funkcja HAMALERT jest traktowana jako wylaczona.
+
+9) Stabilnosc i wydajnosc
+- Dodano osobne mutexy dla list spotow POTA i HAMALERT.
+- Uporzadkowano sekcje odczytu i aktualizacji danych, aby ograniczyc ryzyko kolizji.
+- Dodano dodatkowe zabezpieczenia dla pracy UI i aktualizacji list spotow.
+
+10) Dodatkowe poprawki funkcjonalne
+- Dodano pelna obsluge polowkowych stref czasowych, np. 2.5.
+- Panel WWW wysyla timezone jako float, a firmware poprawnie zapisuje i odczytuje taka wartosc.
+- Poprawiono opisy formularzy oraz drobne korekty ukladu TFT.
+
+Uwagi migracyjne:
+- Po aktualizacji z 1.2 do 1.22 zalecane jest wejscie do konfiguracji WWW i ponowny zapis ustawien.
+- Dotyczy to szczegolnie sekcji DX Cluster, WiFi, APRS, TFT i nowych pol konfiguracyjnych.
+- Filtry multi-select dla DX / POTA / HAMALERT dzialaja runtime-only i po restarcie wracaja do stanu domyslnego.

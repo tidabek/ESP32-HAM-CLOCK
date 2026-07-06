@@ -14,7 +14,7 @@ Wybierasz pliki do wgrania:
 bootloader.bin	0x1000	Pierwszy kod startowy (czasem 0x0 dla ESP32-S3, ale dla CYD to 0x1000).
 partitions.bin	0x8000	Tabela partycji (definiuje gdzie jest firmware i system plików).
 firmware.bin	0x10000	Główny program aplikacji.
-littlefs.bin	0x290000	Adres zależy od wielkości partycji LittleFS.
+littlefs.bin	0x2D0000	Adres zależy od wielkości partycji LittleFS. ( Uwaga nowy offset inny niż dotychczas)
 
 Jeśli dobrze wpisałeś offsety, kliknij PROGRAM.
 
